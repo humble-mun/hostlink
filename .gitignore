@@ -199,6 +199,5 @@ Temporary Items
 .idea/*.xml
 
 vendor
-debug
 bin
 *.elf
