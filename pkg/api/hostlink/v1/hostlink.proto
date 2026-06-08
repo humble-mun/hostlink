@@ -1,0 +1,92 @@
+syntax = "proto3";
+
+package hostlink.v1;
+
+option go_package = "github.com/humble-mun/hostlink/pkg/api/hostlink/v1;hostlinkv1";
+
+// AgentLink is the single gRPC service spanning the controller (server, public
+// entrypoint) and the agent (client, behind NAT). Because under HTTP/2 a server
+// cannot initiate an RPC or open a stream to a client, every "reverse" channel
+// (command push, port-forward stream open) is modeled as a stream the agent
+// opens and the controller drives over the response direction.
+service AgentLink {
+  // Opened once after the agent connects; the controller pushes commands to the
+  // agent down the response stream. All server->agent commands travel over this
+  // already-open stream.
+  rpc Control(stream AgentEvent) returns (stream Command);
+
+  // One per forwarded public TCP connection; opened by the agent, first frame
+  // carries session_id for pairing. Internal cross-pod forwarding reuses this
+  // same service definition (just dialed to a sibling pod).
+  rpc Forward(stream Frame) returns (stream Frame);
+}
+
+// AgentEvent is the agent->controller direction of the Control stream.
+message AgentEvent {
+  string agent_id = 1;
+  oneof kind {
+    Hello hello = 2;          // initial handshake: auth, capability declaration
+    Heartbeat heartbeat = 3;  // refresh the TTL of the agent->pod mapping in Redis
+    DockerEvent event = 4;    // container start/stop/die reports
+  }
+}
+
+// Hello is the first message an agent sends to authenticate and declare itself.
+message Hello {
+  string token = 1;
+}
+
+// Heartbeat refreshes the agent->pod mapping TTL in the registry.
+message Heartbeat {}
+
+// DockerEvent reports a local container lifecycle transition observed via the
+// Docker event stream.
+message DockerEvent {
+  string type = 1;
+  string container_id = 2;
+}
+
+// Command is the controller->agent direction of the Control stream.
+message Command {
+  oneof cmd {
+    OpenForward open_forward = 1; // tell the agent to open a Forward stream for a session
+    DockerOp    docker_op    = 2; // run/stop/start/pause/unpause/rm
+    ExposeRule  expose_rule  = 3; // add/remove a port-exposure rule
+  }
+}
+
+// OpenForward instructs the agent to open a Forward stream for a pending public
+// connection identified by session_id, targeting a container-side address.
+message OpenForward {
+  string session_id = 1;
+  string target = 2; // container-side addr, e.g. 172.30.1.5:8080
+}
+
+// DockerOp carries a container lifecycle operation. spec is an opaque payload
+// whose schema is defined by the op (e.g. a container create spec for "run").
+message DockerOp {
+  string op = 1;
+  string container_id = 2;
+  bytes  spec = 3;
+}
+
+// ExposeRule adds or removes a port-exposure mapping for a container target.
+message ExposeRule {
+  string container_target = 1;
+  uint32 public_port = 2;
+  bool   remove = 3;
+}
+
+// Frame is the unit of the raw-TCP byte pipe carried over a Forward stream.
+// Because a gRPC stream's own lifecycle cannot represent TCP's independent
+// per-direction half-close, half-close and reset are explicit frame types.
+message Frame {
+  string session_id = 1; // set on the first frame of a Forward stream, for pairing
+  enum Type {
+    DATA = 0;
+    HALF_CLOSE = 1;
+    RESET = 2;
+  }
+  Type  type = 2;
+  bytes data = 3; // valid only when Type == DATA
+}
