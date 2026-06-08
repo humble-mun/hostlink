@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name }}
+  namespace: {{ .Release.Namespace }}
+# The controller does not access the Kubernetes API on the currently
+# implemented path, so no ClusterRole/Binding is granted yet and the token is
+# not mounted (the Pod spec sets automountServiceAccountToken: false). The
+# ServiceAccount is created unconditionally because upcoming controller logic
+# (multi-replica routing / sibling-pod discovery) will need to operate on
+# Kubernetes resources -- the ClusterRole and Binding will be added here then.

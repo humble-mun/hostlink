@@ -24,7 +24,7 @@ It builds two binaries:
 A single Go module; one binary per subdirectory under `cmd/` (the standard Go layout for multiple binaries):
 
 ```
-github.com/<org>/hostlink
+github.com/humble-mun/hostlink
 ├── cmd/
 │   ├── controller/   main.go    # builds hostlink-controller (cloud)
 │   └── agent/        main.go    # builds hostlink-agent (host)
@@ -162,7 +162,7 @@ Tie exposure rules to lifecycle: the agent subscribes to Docker events via `clie
 ```proto
 syntax = "proto3";
 package hostlink.v1;
-option go_package = "github.com/<org>/hostlink/pkg/api/hostlink/v1;hostlinkv1";
+option go_package = "github.com/humble-mun/hostlink/pkg/api/hostlink/v1;hostlinkv1";
 
 service AgentLink {
   // Opened once after the agent connects; the controller pushes commands to the agent
@@ -227,18 +227,19 @@ relay(localTCP, frameStream):
   1. an **mTLS gRPC listener** (dedicated `WithTCPListener` + `WithMTLS`) that agents dial out to and establish their `Control`/`Forward` connections on; exposed externally through the ingress;
   2. a **plaintext (h2c) default listener** bound in-cluster only, serving `/metrics` (scraped by Prometheus), `/probe`, `/version`, and `/logging` — no client-cert requirement so K8s probes and Prometheus can reach it.
 - Ingress (L4 LoadBalancer, Cilium environment):
-  1. the mTLS gRPC port above, for agent dial-out;
-  2. a **reserved TCP port range** (e.g. `1025–2025`), all routed to every replica, used for tunnel exposure — "exposing" is an application-level "allocate a port from the pool + write Redis"; **pods already listen on the whole range, so no Service/LB change is needed per exposure**.
+  1. the mTLS gRPC port above, for agent dial-out — the chart provides this Ingress (gated on `ingress.host`), and it MUST do L4/TLS passthrough so the controller still terminates mTLS itself (see §9);
+  2. a **reserved TCP port range** (e.g. `1025–2025`), all routed to every replica, used for tunnel exposure — "exposing" is an application-level "allocate a port from the pool + write Redis"; **pods already listen on the whole range, so no Service/LB change is needed per exposure**. Design-only: the port-forward/Redis path is not implemented, so the chart does not yet open this range.
 - Bypass note: the chassis server applies the same handler to every listener, so the plaintext default listener would also accept gRPC. The split relies on **network-layer isolation** — the default listener is reachable only inside the cluster, while agent gRPC is exposed solely through the mTLS listener via ingress.
-- Dependency: Redis (registry + port allocation).
-- Replicas forward to each other over internal gRPC (§4.5), addressed via a headless Service / pod addressing.
+- Dependency: Redis (registry + port allocation) — design-only; not yet wired in the controller code.
+- Replicas forward to each other over internal gRPC for cross-pod routing (§4.5). That path is design-only and not yet implemented, so the chart ships a single normal (load-balanced) ClusterIP Service — the `/metrics` fan-out is stateless and any replica can answer. Pod-to-pod addressing (a headless Service or equivalent) is to be added only when the cross-pod forward path lands.
 
 > **Infra decision (decoupled from the Go code):** confirm that the Cilium LB / your NLB can handle a port range of the needed size; if not, shrink the range or evaluate the Gateway API `TCPRoute`.
 
 ### hostlink-agent (external host)
 
-- Form: a static Go binary running as a **systemd service**.
-- Behavior: **dials out** to the controller's public gRPC endpoint; manages the local Docker daemon; carries tunnels; runs alongside a node_exporter sidecar (`127.0.0.1:9100`).
+- Form: a static Go binary (installed as `/usr/local/bin/hostlink-agent`) running as a **systemd service**; the unit and an example config live in `deploy/` (`deploy/hostlink-agent.service`, `deploy/agent.yaml`).
+- Configuration: the agent reads all settings from `/etc/humble-mun/agent.yaml` (the chassis registers viper `SetConfigName("agent")` + `AddConfigPath("/etc/humble-mun")`; the binary's `version.Name` is `agent`). The systemd unit passes **no** command-line flags so config edits need no `daemon-reload`, and viper `WatchConfig` reloads the file at runtime. YAML keys are the flag names verbatim (`controller-endpoint`, `tls-ca-path`, `tls-cert-path`, `tls-key-path`, `tls-server-name`, `node-name`); each can also be overridden by an `HM_*` env var.
+- Behavior: **dials out** to the controller's public gRPC endpoint with mTLS (the only behavior implemented today is the `Control` stream: `Hello` + heartbeats). Managing the local Docker daemon, carrying tunnels, and the node_exporter sidecar on `127.0.0.1:9100` are design goals (§7) — no code path opens Docker or talks to node_exporter yet, so the systemd unit treats `docker.service` as a soft (`Wants`) ordering dependency, not a hard requirement.
 - Network: behind NAT; only needs outbound reachability to the controller.
 
 ---

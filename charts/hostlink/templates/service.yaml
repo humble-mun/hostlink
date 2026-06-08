@@ -1,0 +1,34 @@
+{{- $grpcPort := last (splitList ":" .Values.grpc.bindAddress) }}
+{{- $httpPort := last (splitList ":" .Values.http.bindAddress) }}
+# ---------------------------------------------------------------------------
+# Service. Carries BOTH ports:
+#   - grpc: agent-facing mTLS listener, exposed externally through the ingress.
+#     The controller terminates mTLS itself, so traffic must reach it as raw
+#     TCP (the ingress does L4/TLS passthrough -- see the Ingress in
+#     templates/deployment.yaml).
+#   - http: in-cluster plaintext default listener (metrics/probe/version/
+#     logging). Never exposed through the ingress; kept here so Prometheus and
+#     in-cluster clients reach /metrics via this ClusterIP. The metrics fan-out
+#     is stateless -- any replica answers /metrics by aggregating the agents it
+#     currently holds -- so a normal load-balanced ClusterIP is sufficient and
+#     no headless/per-pod addressing is required.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Release.Name }}
+spec:
+  selector:
+    app: {{ .Release.Name }}
+  ports:
+  - name: grpc
+    port: {{ $grpcPort }}
+    targetPort: grpc
+    protocol: TCP
+  - name: http
+    port: {{ $httpPort }}
+    targetPort: http
+    protocol: TCP

@@ -1,0 +1,168 @@
+{{- $grpcPort := last (splitList ":" .Values.grpc.bindAddress) }}
+{{- $httpPort := last (splitList ":" .Values.http.bindAddress) }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}
+  namespace: {{ .Release.Namespace }}
+data:
+  # viper reads /etc/humble-mun/controller.yaml at startup (configName =
+  # "controller", set from the binary name via the version.Name ldflag).
+  # Keys are the flag names with dashes (chassis maps them 1:1 to flags).
+  controller.yaml: |+
+    # Default listener: left plaintext (h2c) for in-cluster metrics/probe.
+    # tls-cert-path / tls-key-path are deliberately empty so the chassis
+    # default listener does not terminate TLS here.
+    http-bind-address: {{ .Values.http.bindAddress }}
+    tls-cert-path: ""
+    tls-key-path: ""
+    # mTLS gRPC listener: agent-facing, exposed through the ingress.
+    grpc-bind-address: {{ .Values.grpc.bindAddress }}
+    grpc-tls-cert-path: {{ .Values.grpc.tlsCertPath }}
+    grpc-tls-key-path: {{ .Values.grpc.tlsKeyPath }}
+    grpc-tls-ca-path: {{ .Values.grpc.tlsCAPath }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Release.Name }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}
+    spec:
+      serviceAccountName: {{ .Release.Name }}
+      # The controller does not call the Kubernetes API on the implemented
+      # path, so the SA token is not mounted (reduces attack surface).
+      automountServiceAccountToken: false
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      containers:
+      # -----------------------------------------------------------------------
+      # Main container: the hostlink-controller.
+      # All configuration is sourced from /etc/humble-mun/controller.yaml (viper).
+      # -----------------------------------------------------------------------
+      - name: controller
+        image: {{ .Values.image }}
+        command:
+        - controller
+        env:
+        - name: HM_NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        ports:
+        # In-cluster plaintext listener (metrics / probe / version / logging).
+        - name: http
+          containerPort: {{ $httpPort }}
+          protocol: TCP
+        # Agent-facing mTLS gRPC listener.
+        - name: grpc
+          containerPort: {{ $grpcPort }}
+          protocol: TCP
+        volumeMounts:
+        # viper config file mounted as a single file via subPath.
+        - name: config
+          mountPath: /etc/humble-mun/controller.yaml
+          subPath: controller.yaml
+          readOnly: true
+        # mTLS server cert/key + agent CA bundle.
+        - name: grpc-pki
+          mountPath: /etc/humble-mun/controller
+          readOnly: true
+        resources:
+          {{- toYaml .Values.resources | nindent 10 }}
+        # Probes hit the in-cluster plaintext default listener on 8080.
+        startupProbe:
+          httpGet:
+            path: /probe
+            port: {{ $httpPort }}
+            scheme: HTTP
+          periodSeconds: 2
+          failureThreshold: 30
+        livenessProbe:
+          httpGet:
+            path: /probe
+            port: {{ $httpPort }}
+            scheme: HTTP
+          periodSeconds: 15
+          timeoutSeconds: 3
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /probe
+            port: {{ $httpPort }}
+            scheme: HTTP
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 2
+
+      volumes:
+      # viper config file: mounted as a single file via subPath.
+      - name: config
+        configMap:
+          name: {{ .Release.Name }}
+      # mTLS material for the agent-facing gRPC listener.
+      - name: grpc-pki
+        secret:
+          secretName: {{ .Values.grpc.tlsSecretName }}
+---
+{{- if .Values.ingress.host }}
+# ---------------------------------------------------------------------------
+# Agent-facing gRPC Ingress.
+# Routes the external host to the controller's gRPC port ONLY. The controller
+# terminates mTLS itself, so this ingress must pass raw TCP through without
+# terminating TLS -- configure that via .Values.ingress.annotations (it is
+# ingress-controller specific). If the ingress instead terminates TLS (e.g. an
+# auto-provisioned wildcard cert), the agent client certificate is stripped and
+# the agent identity model collapses -- so passthrough MUST be asserted
+# explicitly. The in-cluster plaintext default listener (http: metrics/probe/
+# version/logging) is intentionally never routed here.
+# ---------------------------------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ .Release.Name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Release.Name }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- range $key, $value := . }}
+    {{ $key }}: {{ $value | quote }}
+    {{- end }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  rules:
+  - host: {{ .Values.ingress.host }}
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: {{ .Release.Name }}
+            port:
+              number: {{ $grpcPort }}
+{{- end }}

@@ -234,7 +234,7 @@ The controller requires-and-verifies the agent client certificate (`RequireAndVe
 
 ## CLI Flags
 
-All flags can also be set via environment variables: uppercase the flag, replace `-` with `_`, and prefix with `HM_` (e.g. `--controller-endpoint` → `HM_CONTROLLER_ENDPOINT`). Config may also be supplied as a YAML file under `/etc/humble-mun/<binary>.yaml`.
+All flags can also be set via environment variables: uppercase the flag, replace `-` with `_`, and prefix with `HM_` (e.g. `--controller-endpoint` → `HM_CONTROLLER_ENDPOINT`). Config may also be supplied as a YAML file at `/etc/humble-mun/<binary>.yaml` (`agent.yaml` or `controller.yaml`, after the binary's `version.Name`), with the flag names as keys; the file is watched and reloaded at runtime. Precedence: flags > env > config file.
 
 ### Agent flags
 
@@ -263,19 +263,20 @@ The controller also inherits the chassis HTTP server flags (`--http-bind-address
 
 ### hostlink-controller (cloud)
 
-- **Form:** a Kubernetes **Deployment, ≥2 replicas** (HA).
+- **Form:** a Kubernetes **Deployment, ≥2 replicas** (HA). A Helm chart is provided at `charts/hostlink/` (`helm install <release> charts/hostlink`); it renders a ConfigMap holding `/etc/humble-mun/controller.yaml`, the Deployment, a ClusterIP Service carrying both the gRPC and in-cluster HTTP ports, and — when `ingress.host` is set — the agent-facing gRPC Ingress.
 - **Two listeners** (the chassis HTTP/2 server multiplexes gRPC and Gin onto each listener — `Content-Type: application/grpc` with HTTP/2 routes to the gRPC server, everything else to Gin):
   1. an **mTLS gRPC listener** (`--grpc-bind-address` + `WithTLSCert` + `WithMTLS`) that agents dial out to; exposed externally through the ingress.
   2. a **plaintext (h2c) default listener**, bound in-cluster only, serving `/metrics` (Prometheus), `/probe`, `/version`, and `/logging`.
-- **Ingress (L4 LoadBalancer):** the mTLS gRPC port for agent dial-out, plus (by design) a **reserved TCP port range** (e.g. `1025–2025`) routed to every replica for tunnel exposure. Exposing a port is an application-level "allocate from the pool + write Redis"; pods already listen on the whole range, so no per-exposure Service/LB change is needed.
-- **Dependency:** Redis (registry + port allocation). Replicas forward to each other over internal gRPC.
+- **Ingress (L4 LoadBalancer):** the mTLS gRPC port for agent dial-out. Because the controller terminates mTLS itself, the Ingress MUST do L4/TLS **passthrough** (asserted explicitly via controller-specific annotations) — terminating TLS would strip the agent client certificate and break the identity model. By design a **reserved TCP port range** (e.g. `1025–2025`) is also routed to every replica for tunnel exposure (allocate from the pool + write Redis; pods already listen on the whole range, so no per-exposure Service/LB change is needed) — this range is design-only and the chart does not open it yet.
+- **Dependency:** Redis (registry + port allocation) and cross-replica internal-gRPC forwarding are design-only; not yet wired in code, so the chart ships a single load-balanced ClusterIP Service (the `/metrics` fan-out is stateless).
 
 > **Bypass note.** The chassis server applies the same handler to every listener, so the plaintext default listener would also accept gRPC. The split relies on **network-layer isolation** — the default listener is reachable only inside the cluster, while agent gRPC is exposed solely through the mTLS listener via the ingress.
 
 ### hostlink-agent (external host)
 
-- **Form:** a static Go binary running as a **systemd service**.
-- **Behavior:** dials out to the controller's public gRPC endpoint; manages the local Docker daemon; carries tunnels; runs alongside a node_exporter sidecar on `127.0.0.1:9100`.
+- **Form:** a static Go binary (`/usr/local/bin/hostlink-agent`) running as a **systemd service**. The unit and an example config ship in `deploy/` (`deploy/hostlink-agent.service`, `deploy/agent.yaml`).
+- **Configuration:** the agent reads all settings from `/etc/humble-mun/agent.yaml` (chassis viper `SetConfigName("agent")` + `AddConfigPath("/etc/humble-mun")`; YAML keys are the flag names verbatim, each overridable by an `HM_*` env var). The systemd unit passes **no** command-line flags, and viper `WatchConfig` reloads the file at runtime, so changing config needs neither `systemctl daemon-reload` nor a unit edit.
+- **Behavior:** dials out to the controller's public gRPC endpoint over mTLS. Today only the `Control` stream (`Hello` + `Heartbeat`) is implemented; managing the local Docker daemon, carrying tunnels, and the node_exporter sidecar on `127.0.0.1:9100` are planned (see [Roadmap](#roadmap)). Accordingly the unit treats `docker.service` as a soft (`Wants`) ordering dependency, not a hard requirement.
 - **Network:** behind NAT; only needs **outbound** reachability to the controller.
 
 ---

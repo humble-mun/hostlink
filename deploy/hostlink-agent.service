@@ -1,0 +1,98 @@
+# hostlink-agent systemd unit
+#
+# The agent is a single static Go binary that runs on each external Linux host
+# (on-prem / colo, behind NAT). It dials OUTBOUND to the cloud-side
+# hostlink-controller over a mutually-authenticated TLS (mTLS) gRPC connection
+# and keeps it open: it sends a Hello, then heartbeats, and (by design) will
+# carry command, metrics and port-forward traffic over that one connection.
+#
+# Install:
+#   1. Copy the binary to /usr/local/bin/hostlink-agent
+#        go build -mod=vendor -o bin/hostlink-agent ./cmd/agent   # (cross-compiled for the host)
+#        install -m 0755 bin/hostlink-agent /usr/local/bin/hostlink-agent
+#   2. Drop the agent's mTLS material under /etc/humble-mun/agent/ :
+#        tls.crt  - client certificate the agent presents to the controller
+#        tls.key  - matching private key (keep mode 0640, owned by the agent user)
+#        ca.crt   - CA bundle used to verify the controller's server certificate
+#   3. Write the agent configuration to /etc/humble-mun/agent.yaml (see the
+#      companion agent.yaml in this directory for a documented example).
+#   4. systemctl daemon-reload && systemctl enable --now hostlink-agent
+#
+# Configuration model:
+#   The agent reads ALL of its settings from /etc/humble-mun/agent.yaml. The
+#   chassis wires viper to SetConfigName("agent") + AddConfigPath("/etc/humble-mun")
+#   (the binary's name is 'agent', set via -ldflags version.Name at build time),
+#   so the file path is fixed at /etc/humble-mun/agent.yaml. The YAML keys are the
+#   flag names verbatim (controller-endpoint, tls-ca-path, ...).
+#
+#   Because the chassis also calls viper.WatchConfig(), edits to agent.yaml are
+#   picked up at runtime WITHOUT `systemctl daemon-reload` and without editing the
+#   unit. This is exactly why ExecStart passes NO command-line flags: the running
+#   configuration lives entirely in the config file, not in the unit.
+
+[Unit]
+Description=hostlink agent (external-host control-plane link to hostlink-controller)
+Documentation=https://github.com/humble-mun/hostlink
+# The agent only needs outbound reachability to the controller; wait for the
+# network to be configured before dialing out.
+Wants=network-online.target
+After=network-online.target
+# The agent is designed to manage the local Docker daemon. No code path opens
+# the Docker socket yet, so Docker is a soft (Wants) ordering dependency, not a
+# hard requirement: the link to the controller still comes up without it.
+Wants=docker.service
+After=docker.service
+
+# Don't hot-loop forever on a hard-failing config (e.g. bad or missing certs).
+# StartLimit* are parsed in the [Unit] section.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+
+# All configuration is read from /etc/humble-mun/agent.yaml (see header). The
+# agent self-discovers that file via the chassis viper setup, so ExecStart passes
+# NO flags: editing agent.yaml is enough, no unit edit or daemon-reload required.
+# (--controller-endpoint is mandatory; if it is absent from agent.yaml the agent
+# exits immediately, and the Restart policy below will keep retrying.)
+ExecStart=/usr/local/bin/hostlink-agent
+
+# Keep the link up: reconnect on any exit, with a short backoff so a controller
+# restart or transient network drop is recovered automatically.
+Restart=always
+RestartSec=5s
+
+# Run as a dedicated, stable system user. A static user (not DynamicUser) is
+# required because the mTLS material under /etc/humble-mun/agent/ is provisioned
+# out-of-band by the operator and must have a predictable owner, and because the
+# agent will later need to join the 'docker' group to reach the Docker socket.
+# Create it once at install time:
+#   useradd --system --no-create-home --shell /usr/sbin/nologin hostlink
+#   chown -R hostlink:hostlink /etc/humble-mun/agent && chmod 0750 /etc/humble-mun/agent
+#   chmod 0640 /etc/humble-mun/agent/tls.key
+User=hostlink
+Group=hostlink
+
+# Sandboxing. These are conservative defaults appropriate for an outbound-only
+# network client with no local listeners that matter off-host.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# Outbound TCP to the controller (and, by design, the local node_exporter on
+# 127.0.0.1:9100) only needs IPv4/IPv6 stream sockets.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# Log to the journal under this identifier.
+SyslogIdentifier=hostlink-agent
+
+[Install]
+WantedBy=multi-user.target

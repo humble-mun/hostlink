@@ -1,0 +1,101 @@
+# ---------------------------------------------------------------------------
+# Image
+# ---------------------------------------------------------------------------
+image: harbor-c0a811fc.nip.io/humble-mun/hostlink-controller:v0.1.0
+
+# replicaCount is the number of controller pods. The controller is designed to
+# run with >=2 replicas for HA: each agent pins its connection to the one pod it
+# dialed, and public TCP forwarded through the L4 LB lands on any replica, so
+# multiple replicas are required for the cross-pod routing path to be exercised.
+replicaCount: 2
+
+# ---------------------------------------------------------------------------
+# mTLS gRPC listener (agent connections)
+# ---------------------------------------------------------------------------
+# This is the ingress-facing listener that NAT'd agents dial out to. It
+# terminates mutual TLS (TLS 1.3 minimum, no insecure fallback): the controller
+# presents grpc.tlsCertPath/tlsKeyPath and requires-and-verifies each agent's
+# client certificate against grpc.tlsCAPath. This is the agent identity
+# mechanism at the connection layer.
+grpc:
+  # bindAddress is the host:port the mTLS gRPC listener binds, as host:port.
+  # Maps to --grpc-bind-address.
+  bindAddress: "0.0.0.0:8443"
+
+  # tlsCertPath / tlsKeyPath are the in-container paths to the server
+  # certificate and key the controller presents to agents.
+  # Maps to --grpc-tls-cert-path / --grpc-tls-key-path.
+  tlsCertPath: /etc/humble-mun/controller/tls.crt
+  tlsKeyPath:  /etc/humble-mun/controller/tls.key
+
+  # tlsCAPath is the in-container path to the CA bundle used to verify agent
+  # client certificates. Maps to --grpc-tls-ca-path.
+  tlsCAPath: /etc/humble-mun/controller/ca.crt
+
+  # tlsSecretName is the Secret (type kubernetes.io/tls or opaque) holding the
+  # server cert/key and CA bundle mounted at /etc/humble-mun/controller. Required:
+  # there is no insecure fallback, so the pod will not serve agents without it.
+  tlsSecretName: hostlink-controller-grpc-tls
+
+# ---------------------------------------------------------------------------
+# Default listener (in-cluster: metrics / probe / version / logging)
+# ---------------------------------------------------------------------------
+# The chassis HTTP/2 server multiplexes gRPC and Gin onto every listener. This
+# default listener is left PLAINTEXT (h2c) on purpose and must stay reachable
+# only inside the cluster: it serves /metrics (Prometheus), /probe, /version and
+# /logging. Because the shared chassis handler would also accept gRPC here, the
+# agent/data split relies on network-layer isolation -- this listener is never
+# exposed through the ingress.
+http:
+  # bindAddress maps to --http-bind-address. Kept plaintext (no TLS cert/key)
+  # so K8s probes and Prometheus can reach it over h2c in-cluster.
+  bindAddress: "0.0.0.0:8080"
+
+# ---------------------------------------------------------------------------
+# Ingress (agent-facing gRPC only)
+# ---------------------------------------------------------------------------
+# Exposes ONLY the mTLS gRPC listener so NAT'd agents can dial out to the
+# controller. The controller terminates mutual TLS itself (the agent client
+# certificate is the identity), so the ingress MUST pass raw TCP through and
+# must NOT terminate TLS -- otherwise the client cert is stripped and the
+# agent identity model collapses. The same failure occurs if the ingress (or
+# the platform default) auto-attaches a wildcard server cert and terminates:
+# the agent then validates the ingress cert, not the controller's, and its
+# client cert never reaches the controller. TLS passthrough must therefore be
+# asserted EXPLICITLY via annotations because it is ingress-controller specific
+# (e.g. nginx, which also requires --enable-ssl-passthrough on the controller):
+#   nginx.ingress.kubernetes.io/ssl-passthrough: "true"
+# Only ingress controllers that support true L4 passthrough (nginx with
+# ssl-passthrough, HAProxy, Contour TCPProxy) are safe here. For production a
+# raw L4 Service type=LoadBalancer or a Gateway-API TCPRoute avoids this whole
+# class of bug; leave ingress.host empty to disable this Ingress entirely.
+# The in-cluster plaintext default listener (http) is never exposed here.
+ingress:
+  # className selects the IngressClass (the ingress controller) to use.
+  className: ""
+
+  # host is the external hostname agents dial out to for the gRPC listener.
+  host: ""
+
+  # annotations carries extra controller-specific annotations. This is where
+  # TLS-passthrough behavior is enabled (see the note above) -- left empty by
+  # default so the operator opts in explicitly for their ingress controller.
+  annotations: {}
+
+# ---------------------------------------------------------------------------
+# Pod scheduling
+# ---------------------------------------------------------------------------
+# nodeSelector is intentionally omitted: node targeting is expressed through
+# affinity below.
+affinity: {}
+tolerations: []
+
+priorityClassName: ""
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi

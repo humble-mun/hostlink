@@ -1,0 +1,48 @@
+# hostlink-agent configuration — install to /etc/humble-mun/agent.yaml
+#
+# The agent reads this file at startup and watches it for changes (the chassis
+# calls viper.WatchConfig), so edits are picked up at runtime without a
+# `systemctl daemon-reload` and without restarting the unit. The lookup path is
+# fixed: the chassis registers SetConfigName("agent") + AddConfigPath("/etc/humble-mun"),
+# and the binary's name is "agent" (set via -ldflags version.Name at build), so
+# the file must live at /etc/humble-mun/agent.yaml.
+#
+# Keys are the flag names verbatim. Anything set here can also be overridden by
+# an HM_* environment variable (uppercase the key, replace '-' with '_', prefix
+# HM_ — e.g. controller-endpoint -> HM_CONTROLLER_ENDPOINT).
+
+# --------------------------------------------------------------------------
+# Controller connection
+# --------------------------------------------------------------------------
+
+# Address of the hostlink-controller gRPC endpoint to dial, as host:port.
+# REQUIRED — the agent exits immediately if this is empty.
+controller-endpoint: "controller.example.com:8443"
+
+# Server name to verify against the controller's certificate. Set this when the
+# certificate's SAN does not match the dial host (otherwise leave it empty and
+# the controller cert is verified against the endpoint host).
+tls-server-name: "controller.example.com"
+
+# --------------------------------------------------------------------------
+# mTLS material (provisioned out-of-band by the operator)
+# --------------------------------------------------------------------------
+# The agent presents a client certificate to the controller and verifies the
+# controller's server certificate against the CA bundle. There is no insecure
+# fallback: if any of these are missing or invalid, the connection fails hard.
+
+# CA bundle used to verify the controller's server certificate.
+tls-ca-path: "/etc/humble-mun/agent/ca.crt"
+# Client certificate the agent presents to the controller for mTLS.
+tls-cert-path: "/etc/humble-mun/agent/tls.crt"
+# Private key matching the client certificate.
+tls-key-path: "/etc/humble-mun/agent/tls.key"
+
+# --------------------------------------------------------------------------
+# Identity
+# --------------------------------------------------------------------------
+
+# Logical name for this host; becomes the agent_id the controller sees. Defaults
+# to empty — set it to the hostname (or another stable identifier) so the agent
+# is distinguishable on the controller side.
+node-name: ""
