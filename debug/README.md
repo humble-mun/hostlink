@@ -17,13 +17,13 @@ with no insecure fallback**:
   hostname/SAN.
 - The **agent** presents a *client* certificate and verifies the controller's
   *server* certificate against the **CA** *and* against the server name it was
-  told to expect (`tls-server-name`).
+  told to expect (`controller-tls-server-name`).
 
 That asymmetry dictates the certificate extensions:
 
 | Certificate | Extended Key Usage | Subject Alternative Name |
 |-------------|--------------------|--------------------------|
-| controller (server) | `serverAuth` | **must** contain the name the agent dials / sets as `tls-server-name` |
+| controller (server) | `serverAuth` | **must** contain the name the agent dials / sets as `controller-tls-server-name` |
 | agent (client) | `clientAuth` | optional (controller ignores it; we set `DNS:<agent-id>` for readability) |
 
 All keys are EC P-256, signatures SHA-256, validity 3650 days.
@@ -79,11 +79,11 @@ openssl x509 -req -in /tmp/controller.csr \
 
 **The SAN list is the part you must get right.** The agent verifies the
 controller certificate's SAN against whatever it has configured as
-`tls-server-name`. The default list above covers `localhost`, the bare service
+`controller-tls-server-name`. The default list above covers `localhost`, the bare service
 name, the in-cluster DNS names, and a sample external name. **For a real ingress
 you must regenerate with your actual ingress host in the SAN** and set the
-agent's `tls-server-name` to one of these entries. (Note: the documented
-"defaults to the endpoint host" behaviour for an empty `tls-server-name` is *not*
+agent's `controller-tls-server-name` to one of these entries. (Note: the documented
+"defaults to the endpoint host" behaviour for an empty `controller-tls-server-name` is *not*
 implemented in the agent yet — always set it explicitly.)
 
 ### Step C — per-agent (client) certificate
@@ -168,10 +168,10 @@ Then set the connection details in `/etc/humble-mun/agent.yaml` (see
 
 ```yaml
 controller-endpoint: hostlink-controller:8443   # host:port the agent dials
-tls-server-name: hostlink-controller            # MUST be a SAN entry of the controller cert
-tls-ca-path: /etc/humble-mun/agent/ca.crt
-tls-cert-path: /etc/humble-mun/agent/tls.crt
-tls-key-path: /etc/humble-mun/agent/tls.key
+controller-tls-server-name: hostlink-controller    # MUST be a SAN entry of the controller cert
+controller-tls-ca-path: /etc/humble-mun/agent/ca.crt
+agent-tls-cert-path: /etc/humble-mun/agent/tls.crt
+agent-tls-key-path: /etc/humble-mun/agent/tls.key
 node-name: agent-demo
 ```
 

@@ -23,7 +23,7 @@
 #   chassis wires viper to SetConfigName("agent") + AddConfigPath("/etc/humble-mun")
 #   (the binary's name is 'agent', set via -ldflags version.Name at build time),
 #   so the file path is fixed at /etc/humble-mun/agent.yaml. The YAML keys are the
-#   flag names verbatim (controller-endpoint, tls-ca-path, ...).
+#   flag names verbatim (controller-endpoint, controller-tls-ca-path, agent-tls-cert-path, ...).
 #
 #   Because the chassis also calls viper.WatchConfig(), edits to agent.yaml are
 #   picked up at runtime WITHOUT `systemctl daemon-reload` and without editing the
@@ -57,6 +57,10 @@ Type=simple
 # (--controller-endpoint is mandatory; if it is absent from agent.yaml the agent
 # exits immediately, and the Restart policy below will keep retrying.)
 ExecStart=/usr/local/bin/hostlink-agent
+
+# The chassis embeds a Gin HTTP server. Run it in release mode so it does not
+# log the noisy debug-mode startup banner and skips Gin's debug instrumentation.
+Environment=GIN_MODE=release
 
 # Keep the link up: reconnect on any exit, with a short backoff so a controller
 # restart or transient network drop is recovered automatically.

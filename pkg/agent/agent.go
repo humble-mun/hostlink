@@ -23,10 +23,10 @@ import (
 
 const (
 	flagControllerEndpoint = "controller-endpoint"
-	flagTLSCertPath        = "tls-cert-path"
-	flagTLSKeyPath         = "tls-key-path"
-	flagTLSCAPath          = "tls-ca-path"
-	flagTLSServerName      = "tls-server-name"
+	flagTLSCertPath        = "agent-tls-cert-path"
+	flagTLSKeyPath         = "agent-tls-key-path"
+	flagTLSCAPath          = "controller-tls-ca-path"
+	flagTLSServerName      = "controller-tls-server-name"
 )
 
 func RegisterFlags(pfs *pflag.FlagSet) {
@@ -34,7 +34,7 @@ func RegisterFlags(pfs *pflag.FlagSet) {
 	pfs.String(flagTLSCertPath, "", "The path to the client certificate the agent presents to the controller for mTLS.")
 	pfs.String(flagTLSKeyPath, "", "The path to the private key matching the client certificate.")
 	pfs.String(flagTLSCAPath, "", "The path to the CA bundle used to verify the controller's certificate.")
-	pfs.String(flagTLSServerName, "", "The server name to verify against the controller's certificate; defaults to the endpoint host.")
+	pfs.String(flagTLSServerName, "", "The server name to verify against the controller's certificate; if empty, gRPC verifies against the dial endpoint's host, so set it explicitly when the certificate SAN differs from the dial address.")
 }
 
 type Agent interface {
@@ -53,10 +53,18 @@ func New(logger logr.Logger, nodeName string) (ag Agent, err error) {
 		return nil, err
 	}
 
+	dialOpts := []grpc.DialOption{grpc.WithTransportCredentials(creds)}
+	// grpc.NewClient derives the TLS verification name (the :authority) from the
+	// dial target by default, so dialing an IP makes x509 verify against that IP and
+	// ignores tls.Config.ServerName (grpc overwrites it in ClientHandshake). Setting
+	// the authority explicitly is the supported way to verify against a name that
+	// differs from the dial address.
+	if serverName := viper.GetString(flagTLSServerName); serverName != "" {
+		dialOpts = append(dialOpts, grpc.WithAuthority(serverName))
+	}
+
 	var conn *grpc.ClientConn
-	if conn, err = grpc.NewClient(endpoint,
-		grpc.WithTransportCredentials(creds),
-	); err != nil {
+	if conn, err = grpc.NewClient(endpoint, dialOpts...); err != nil {
 		return nil, fmt.Errorf("agent: create gRPC client for %q: %w", endpoint, err)
 	}
 

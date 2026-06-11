@@ -32,7 +32,7 @@ func RegisterFlags(pfs *pflag.FlagSet) {
 func ListenerOptions() []server.ListenerOption {
 	return []server.ListenerOption{
 		server.WithAddr(func() string { return viper.GetString(flagGRPCBindAddress) }),
-		server.WithTLSCert(viper.GetString(flagGRPCTLSCertPath), viper.GetString(flagGRPCTLSKeyPath)),
-		server.WithMTLS(viper.GetString(flagGRPCTLSCAPath)),
+		server.WithTLSCert(func() string { return viper.GetString(flagGRPCTLSCertPath) }, func() string { return viper.GetString(flagGRPCTLSKeyPath) }),
+		server.WithMTLS(func() string { return viper.GetString(flagGRPCTLSCAPath) }),
 	}
 }

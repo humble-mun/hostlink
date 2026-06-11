@@ -226,9 +226,9 @@ The agent↔controller connection requires a working PKI. You need a CA, a contr
 | Side | Presents | Verifies the peer against |
 |------|----------|---------------------------|
 | controller | server cert/key (`--grpc-tls-cert-path` / `--grpc-tls-key-path`) | agent CA bundle (`--grpc-tls-ca-path`) |
-| agent | client cert/key (`--tls-cert-path` / `--tls-key-path`) | controller CA bundle (`--tls-ca-path`) |
+| agent | client cert/key (`--agent-tls-cert-path` / `--agent-tls-key-path`) | controller CA bundle (`--controller-tls-ca-path`) |
 
-The controller requires-and-verifies the agent client certificate (`RequireAndVerifyClientCert`); the agent verifies the controller's server name (`--tls-server-name`, defaulting to the endpoint host). There is **no insecure fallback** — if certificates are missing or invalid, the connection fails hard.
+The controller requires-and-verifies the agent client certificate (`RequireAndVerifyClientCert`); the agent verifies the controller's server name (`--controller-tls-server-name`). If left empty, gRPC verifies against the dial endpoint's host, so set it explicitly whenever the certificate SAN differs from the dial address (e.g. dialing by IP). There is **no insecure fallback** — if certificates are missing or invalid, the connection fails hard.
 
 ---
 
@@ -241,10 +241,10 @@ All flags can also be set via environment variables: uppercase the flag, replace
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--controller-endpoint` | — | Address of the `hostlink-controller` gRPC endpoint to dial, as `host:port` (required) |
-| `--tls-cert-path` | — | Client certificate the agent presents to the controller for mTLS |
-| `--tls-key-path` | — | Private key matching the client certificate |
-| `--tls-ca-path` | — | CA bundle used to verify the controller's certificate |
-| `--tls-server-name` | — | Server name to verify against the controller's certificate (defaults to the endpoint host) |
+| `--agent-tls-cert-path` | — | Client certificate the agent presents to the controller for mTLS |
+| `--agent-tls-key-path` | — | Private key matching the client certificate |
+| `--controller-tls-ca-path` | — | CA bundle used to verify the controller's certificate |
+| `--controller-tls-server-name` | — | Server name to verify against the controller's certificate; if empty, gRPC verifies against the dial endpoint's host, so set it explicitly when the cert SAN differs from the dial address |
 
 ### Controller flags
 

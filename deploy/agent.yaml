@@ -22,7 +22,7 @@ controller-endpoint: "controller.example.com:8443"
 # Server name to verify against the controller's certificate. Set this when the
 # certificate's SAN does not match the dial host (otherwise leave it empty and
 # the controller cert is verified against the endpoint host).
-tls-server-name: "controller.example.com"
+controller-tls-server-name: "controller.example.com"
 
 # --------------------------------------------------------------------------
 # mTLS material (provisioned out-of-band by the operator)
@@ -32,11 +32,11 @@ tls-server-name: "controller.example.com"
 # fallback: if any of these are missing or invalid, the connection fails hard.
 
 # CA bundle used to verify the controller's server certificate.
-tls-ca-path: "/etc/humble-mun/agent/ca.crt"
+controller-tls-ca-path: "/etc/humble-mun/agent/ca.crt"
 # Client certificate the agent presents to the controller for mTLS.
-tls-cert-path: "/etc/humble-mun/agent/tls.crt"
+agent-tls-cert-path: "/etc/humble-mun/agent/tls.crt"
 # Private key matching the client certificate.
-tls-key-path: "/etc/humble-mun/agent/tls.key"
+agent-tls-key-path: "/etc/humble-mun/agent/tls.key"
 
 # --------------------------------------------------------------------------
 # Identity

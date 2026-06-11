@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"sync"
 
 	"github.com/go-logr/logr"
@@ -33,9 +34,9 @@ func newRootCommand() *cobra.Command {
 		RunE: func(_ *cobra.Command, _ []string) (err error) {
 			var rootLogger, logger logr.Logger
 			var httpGin *server.HTTPServer
-			var ctx context.Context
+			var rootCtx context.Context
 			var nodeName string
-			if rootLogger, logger, httpGin, ctx, nodeName, err = app.BaseContext(app.WithInit(init)); err != nil {
+			if rootLogger, logger, httpGin, rootCtx, nodeName, err = app.BaseContext(app.WithInit(init)); err != nil {
 				return
 			}
 			logger = logger.WithValues("nodeName", nodeName)
@@ -52,23 +53,35 @@ func newRootCommand() *cobra.Command {
 
 			logger.Info("agent started")
 			defer logger.Info("agent finished")
+			// Run the HTTP server and the agent under a shared sub-context. If either
+			// one returns (clean exit or error), its deferred cancel() tears down the
+			// other so the whole process exits. A live process with a dead agent is
+			// effectively unavailable, so we'd rather exit and let systemd restart us.
+			ctx, cancel := context.WithCancel(rootCtx)
+			defer cancel()
+
 			wg := new(sync.WaitGroup)
 			wg.Add(2)
+			var httpErr, agentErr error
 			go func() {
 				defer wg.Done()
-				if err = httpGin.Start(ctx); err != nil {
-					logger.Error(err, "start http server failed")
-					return
+				defer cancel()
+				if httpErr = httpGin.Start(ctx); httpErr != nil {
+					logger.Error(httpErr, "start http server failed")
 				}
 			}()
 			go func() {
 				defer wg.Done()
-				if err = ag.Start(ctx); err != nil {
-					logger.Error(err, "start agent failed")
-					return
+				defer cancel()
+				if agentErr = ag.Start(ctx); agentErr != nil {
+					logger.Error(agentErr, "start agent failed")
 				}
 			}()
 			wg.Wait()
+
+			// Join both errors so neither is lost; errors.Join drops nils and returns
+			// nil if both are nil. Done after wg.Wait() so there is no data race.
+			err = errors.Join(agentErr, httpErr)
 			return
 		},
 	}

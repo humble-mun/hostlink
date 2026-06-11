@@ -93,14 +93,14 @@ spec:
         # Probes hit the in-cluster plaintext default listener on 8080.
         startupProbe:
           httpGet:
-            path: /probe
+            path: /healthz
             port: {{ $httpPort }}
             scheme: HTTP
           periodSeconds: 2
           failureThreshold: 30
         livenessProbe:
           httpGet:
-            path: /probe
+            path: /healthz
             port: {{ $httpPort }}
             scheme: HTTP
           periodSeconds: 15
@@ -108,7 +108,7 @@ spec:
           failureThreshold: 3
         readinessProbe:
           httpGet:
-            path: /probe
+            path: /readyz
             port: {{ $httpPort }}
             scheme: HTTP
           periodSeconds: 5

@@ -25,7 +25,8 @@ AGENT_IDS="${AGENT_IDS:-agent-demo}"
 
 # Subject Alternative Names for the controller server certificate. The agent's
 # Go TLS client verifies the controller cert's SAN against the configured
-# tls-server-name, so every name an agent might dial / set as tls-server-name
+# controller-tls-server-name, so every name an agent might dial / set as
+# controller-tls-server-name
 # MUST appear here. For a real ingress, regenerate with your ingress host added.
 CONTROLLER_SANS="DNS:localhost,DNS:hostlink-controller,DNS:hostlink-controller.default.svc,DNS:hostlink-controller.default.svc.cluster.local,DNS:controller.hostlink.local,IP:127.0.0.1"
 
@@ -125,6 +126,6 @@ Create the controller Secret the Helm chart consumes (key names matter):
     --from-file=ca.crt=debug/pki/controller/ca.crt
 
 On each agent host, copy debug/pki/agent/<id>/{ca.crt,tls.crt,tls.key} to
-/etc/humble-mun/agent/ and set controller-endpoint + tls-server-name (one of the
+/etc/humble-mun/agent/ and set controller-endpoint + controller-tls-server-name (one of the
 controller SAN entries, e.g. hostlink-controller) in /etc/humble-mun/agent.yaml.
 EOF
