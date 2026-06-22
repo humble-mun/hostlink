@@ -29,9 +29,14 @@ reachability to the controller.
 | The agent's mTLS material | `ca.crt` (verifies the controller), `tls.crt` + `tls.key` (this agent's client identity) |
 | `root` / `sudo` | To install the binary, create the service user, and write under `/etc/humble-mun/` |
 
-Docker is **not** required yet: no code path opens the Docker socket today, so
-the unit treats `docker.service` as a soft (`Wants`) ordering dependency. The
-only behavior implemented is the `Control` stream (`Hello` + `Heartbeat`).
+Docker is used **lazily**: the agent opens a Docker client (`client.FromEnv`) but
+does not dial the daemon until a request needs it. The only implemented request,
+`images.list` (behind the controller's `GET /api/v1/agents/<id>/images`), reads
+the local image list — so for that endpoint to work the daemon must be reachable
+and the service user must be able to access the Docker socket (add `hostlink` to
+the `docker` group — see [Step 4](#step-4--create-the-service-user)). The agent
+itself still starts and runs the `Control` stream (`Hello` + `Heartbeat`) without
+Docker, so the unit keeps `docker.service` as a soft (`Wants`) dependency.
 
 ## Step 1 — build and install the binary
 

@@ -10,7 +10,7 @@ TAG ?= $(VERSION)$(shell test "$(ARCH)" != amd64 && echo "-$(ARCH)" || true)$(sh
 DEBUG ?= false
 REPO ?= harbor-0afe11c0.nip.io/humble-mun/hostlink-controller
 DOCKERFILE ?= Dockerfile
-GO_VERSION ?= 1.26.3-trixie
+GO_VERSION ?= 1.26.4-trixie
 BASE_PROJECT ?= github.com/humble-mun/chassis
 PROJECT ?= github.com/humble-mun/hostlink
 VERSION_PACKAGE ?= pkg/version

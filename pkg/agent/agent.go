@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/docker/docker/client"
@@ -29,6 +30,7 @@ const (
 	flagTLSServerName      = "controller-tls-server-name"
 )
 
+// RegisterFlags registers the agent's controller-dial endpoint and mTLS flags.
 func RegisterFlags(pfs *pflag.FlagSet) {
 	pfs.String(flagControllerEndpoint, "", "address of the hostlink-controller gRPC endpoint to dial, as host:port")
 	pfs.String(flagTLSCertPath, "", "The path to the client certificate the agent presents to the controller for mTLS.")
@@ -37,11 +39,15 @@ func RegisterFlags(pfs *pflag.FlagSet) {
 	pfs.String(flagTLSServerName, "", "The server name to verify against the controller's certificate; if empty, gRPC verifies against the dial endpoint's host, so set it explicitly when the certificate SAN differs from the dial address.")
 }
 
+// Agent is the hostlink agent: a manager.Runnable that maintains the Control
+// stream to the controller and is closed on shutdown.
 type Agent interface {
 	manager.Runnable
 	io.Closer
 }
 
+// New constructs an Agent that dials the controller at the configured endpoint
+// over mTLS and serves controller-pushed Docker requests over the Control stream.
 func New(logger logr.Logger, nodeName string) (ag Agent, err error) {
 	endpoint := viper.GetString(flagControllerEndpoint)
 	if endpoint == "" {
@@ -52,6 +58,20 @@ func New(logger logr.Logger, nodeName string) (ag Agent, err error) {
 	if err != nil {
 		return nil, err
 	}
+
+	var docker *client.Client
+	// FromEnv is lazy and does not dial the daemon here, so a daemon that is down
+	// at startup does not fail construction; it surfaces when a request runs.
+	if docker, err = client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation()); err != nil {
+		return nil, fmt.Errorf("agent: create docker client: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			if e := docker.Close(); e != nil {
+				logger.Error(e, "failed to close docker client")
+			}
+		}
+	}()
 
 	dialOpts := []grpc.DialOption{grpc.WithTransportCredentials(creds)}
 	// grpc.NewClient derives the TLS verification name (the :authority) from the
@@ -73,6 +93,7 @@ func New(logger logr.Logger, nodeName string) (ag Agent, err error) {
 		nodeName: nodeName,
 		conn:     conn,
 		client:   hostlinkv1.NewAgentLinkClient(conn),
+		docker:   docker,
 	}
 	return ag, nil
 }
@@ -83,6 +104,9 @@ type agent struct {
 	conn     *grpc.ClientConn
 	client   hostlinkv1.AgentLinkClient
 	docker   *client.Client
+
+	stream grpc.BidiStreamingClient[hostlinkv1.AgentEvent, hostlinkv1.Command]
+	sendMu sync.Mutex
 }
 
 func (a *agent) Close() (err error) {
@@ -101,10 +125,10 @@ func (a *agent) Close() (err error) {
 	return
 }
 
-// Start opens the Control stream to the controller and runs the helloworld-level
-// handshake: it sends a Hello, then emits periodic heartbeats until the context
-// is cancelled. This proves end-to-end connectivity; command handling and Docker
-// event reporting are implemented later.
+// Start opens the Control stream to the controller, sends a Hello, then runs two
+// concurrent activities until the context is cancelled or the stream fails: a
+// heartbeat ticker that refreshes the agent->pod mapping, and a receive loop that
+// handles controller-pushed commands (e.g. images.list) and sends back results.
 func (a *agent) Start(ctx context.Context) error {
 	logger := a.logger.WithName("control")
 
@@ -112,14 +136,18 @@ func (a *agent) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("agent: open control stream: %w", err)
 	}
+	a.stream = stream
 
-	if err := stream.Send(&hostlinkv1.AgentEvent{
+	if err := a.send(&hostlinkv1.AgentEvent{
 		AgentId: a.nodeName,
 		Kind:    &hostlinkv1.AgentEvent_Hello{Hello: &hostlinkv1.Hello{}},
 	}); err != nil {
 		return fmt.Errorf("agent: send hello: %w", err)
 	}
 	logger.Info("control stream opened, hello sent")
+
+	recvErrCh := make(chan error, 1)
+	go func() { recvErrCh <- a.receiveCommands(ctx, logger) }()
 
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
@@ -132,8 +160,13 @@ func (a *agent) Start(ctx context.Context) error {
 				return fmt.Errorf("agent: close control stream: %w", err)
 			}
 			return nil
+		case err := <-recvErrCh:
+			if err != nil {
+				return fmt.Errorf("agent: receive commands: %w", err)
+			}
+			return nil
 		case <-ticker.C:
-			if err := stream.Send(&hostlinkv1.AgentEvent{
+			if err := a.send(&hostlinkv1.AgentEvent{
 				AgentId: a.nodeName,
 				Kind:    &hostlinkv1.AgentEvent_Heartbeat{Heartbeat: &hostlinkv1.Heartbeat{}},
 			}); err != nil {
@@ -141,6 +174,56 @@ func (a *agent) Start(ctx context.Context) error {
 			}
 			logger.Info("heartbeat sent")
 		}
+	}
+}
+
+// send serializes writes to the Control stream: the heartbeat loop and command
+// handlers both produce AgentEvents, and a gRPC stream allows only one
+// concurrent Send.
+func (a *agent) send(event *hostlinkv1.AgentEvent) (err error) {
+	a.sendMu.Lock()
+	defer a.sendMu.Unlock()
+	if err = a.stream.Send(event); err != nil {
+		err = fmt.Errorf("send event: %w", err)
+	}
+	return
+}
+
+// receiveCommands reads controller-pushed commands until the stream closes,
+// handling each request on its own goroutine so a slow handler does not stall
+// the receive loop. It returns nil on a clean close (EOF or context cancel).
+func (a *agent) receiveCommands(ctx context.Context, logger logr.Logger) (err error) {
+	for {
+		var cmd *hostlinkv1.Command
+		if cmd, err = a.stream.Recv(); err != nil {
+			if errors.Is(err, io.EOF) {
+				err = nil
+				return
+			}
+			if ctx.Err() != nil {
+				err = nil
+				return
+			}
+			return
+		}
+
+		switch c := cmd.GetCmd().(type) {
+		case *hostlinkv1.Command_Request:
+			go a.handleAndReply(ctx, c.Request, logger)
+		default:
+			logger.Info("received command with unsupported kind")
+		}
+	}
+}
+
+// handleAndReply executes a request and sends its result back over the Control
+// stream. A send failure is logged: the controller-side dispatcher unblocks via
+// its own timeout, so there is nothing to return here.
+func (a *agent) handleAndReply(ctx context.Context, req *hostlinkv1.AgentRequest, logger logr.Logger) {
+	event := a.handleRequest(ctx, req)
+	if err := a.send(event); err != nil {
+		logger.Error(err, "send agent result failed",
+			"requestID", req.GetRequestId(), "method", req.GetMethod())
 	}
 }
 

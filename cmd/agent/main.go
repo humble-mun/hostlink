@@ -5,11 +5,9 @@ import (
 	"errors"
 	"sync"
 
-	"github.com/go-logr/logr"
 	"github.com/spf13/cobra"
 
 	"github.com/humble-mun/chassis/pkg/app"
-	"github.com/humble-mun/chassis/pkg/server"
 	"github.com/humble-mun/chassis/pkg/version"
 
 	"github.com/humble-mun/hostlink/pkg/agent"
@@ -32,32 +30,28 @@ func newRootCommand() *cobra.Command {
 		},
 		SilenceUsage: true,
 		RunE: func(_ *cobra.Command, _ []string) (err error) {
-			var rootLogger, logger logr.Logger
-			var httpGin *server.HTTPServer
-			var rootCtx context.Context
-			var nodeName string
-			if rootLogger, logger, httpGin, rootCtx, nodeName, err = app.BaseContext(app.WithInit(init)); err != nil {
+			var base app.Base
+			if base, err = app.BaseContext(app.WithInit(init)); err != nil {
 				return
 			}
-			logger = logger.WithValues("nodeName", nodeName)
 
 			var ag agent.Agent
-			if ag, err = agent.New(rootLogger, nodeName); err != nil {
+			if ag, err = agent.New(base.RootLogger, base.NodeName); err != nil {
 				return
 			}
 			defer func() {
 				if e := ag.Close(); e != nil {
-					logger.Error(e, "close agent failed")
+					base.Logger.Error(e, "close agent failed")
 				}
 			}()
 
-			logger.Info("agent started")
-			defer logger.Info("agent finished")
+			base.Logger.Info("agent started")
+			defer base.Logger.Info("agent finished")
 			// Run the HTTP server and the agent under a shared sub-context. If either
 			// one returns (clean exit or error), its deferred cancel() tears down the
 			// other so the whole process exits. A live process with a dead agent is
 			// effectively unavailable, so we'd rather exit and let systemd restart us.
-			ctx, cancel := context.WithCancel(rootCtx)
+			ctx, cancel := context.WithCancel(base.Ctx)
 			defer cancel()
 
 			wg := new(sync.WaitGroup)
@@ -66,15 +60,15 @@ func newRootCommand() *cobra.Command {
 			go func() {
 				defer wg.Done()
 				defer cancel()
-				if httpErr = httpGin.Start(ctx); httpErr != nil {
-					logger.Error(httpErr, "start http server failed")
+				if httpErr = base.HTTPGin.Start(ctx); httpErr != nil {
+					base.Logger.Error(httpErr, "start http server failed")
 				}
 			}()
 			go func() {
 				defer wg.Done()
 				defer cancel()
 				if agentErr = ag.Start(ctx); agentErr != nil {
-					logger.Error(agentErr, "start agent failed")
+					base.Logger.Error(agentErr, "start agent failed")
 				}
 			}()
 			wg.Wait()

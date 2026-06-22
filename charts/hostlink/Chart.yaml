@@ -1,8 +1,9 @@
 apiVersion: v2
 name: hostlink
 description: >
-  The cloud-side control plane for hostlink. Runs in Kubernetes (>=2 replicas for
-  HA) as the gRPC server that NAT'd hostlink-agents dial out to over a persistent
+  The cloud-side control plane for hostlink. Runs in Kubernetes as a StatefulSet
+  (1 replica by default; >=2 for HA, which requires Redis and the ControllerPeer
+  plane) — the gRPC server that NAT'd hostlink-agents dial out to over a persistent
   mutually-authenticated (mTLS) connection, dispatching Docker and exposure
   commands, aggregating agent metrics, and driving reverse TCP tunnels.
 type: application

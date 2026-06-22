@@ -67,7 +67,7 @@ func (x Frame_Type) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use Frame_Type.Descriptor instead.
 func (Frame_Type) EnumDescriptor() ([]byte, []int) {
-	return file_hostlink_v1_hostlink_proto_rawDescGZIP(), []int{8, 0}
+	return file_hostlink_v1_hostlink_proto_rawDescGZIP(), []int{11, 0}
 }
 
 // AgentEvent is the agent->controller direction of the Control stream.
@@ -79,6 +79,7 @@ type AgentEvent struct {
 	//	*AgentEvent_Hello
 	//	*AgentEvent_Heartbeat
 	//	*AgentEvent_Event
+	//	*AgentEvent_Result
 	Kind          isAgentEvent_Kind `protobuf_oneof:"kind"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -155,6 +156,15 @@ func (x *AgentEvent) GetEvent() *DockerEvent {
 	return nil
 }
 
+func (x *AgentEvent) GetResult() *AgentResult {
+	if x != nil {
+		if x, ok := x.Kind.(*AgentEvent_Result); ok {
+			return x.Result
+		}
+	}
+	return nil
+}
+
 type isAgentEvent_Kind interface {
 	isAgentEvent_Kind()
 }
@@ -171,11 +181,17 @@ type AgentEvent_Event struct {
 	Event *DockerEvent `protobuf:"bytes,4,opt,name=event,proto3,oneof"` // container start/stop/die reports
 }
 
+type AgentEvent_Result struct {
+	Result *AgentResult `protobuf:"bytes,5,opt,name=result,proto3,oneof"` // reply to a controller->agent AgentRequest
+}
+
 func (*AgentEvent_Hello) isAgentEvent_Kind() {}
 
 func (*AgentEvent_Heartbeat) isAgentEvent_Kind() {}
 
 func (*AgentEvent_Event) isAgentEvent_Kind() {}
+
+func (*AgentEvent_Result) isAgentEvent_Kind() {}
 
 // Hello is the first message an agent sends to authenticate and declare itself.
 type Hello struct {
@@ -321,6 +337,7 @@ type Command struct {
 	//	*Command_OpenForward
 	//	*Command_DockerOp
 	//	*Command_ExposeRule
+	//	*Command_Request
 	Cmd           isCommand_Cmd `protobuf_oneof:"cmd"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -390,6 +407,15 @@ func (x *Command) GetExposeRule() *ExposeRule {
 	return nil
 }
 
+func (x *Command) GetRequest() *AgentRequest {
+	if x != nil {
+		if x, ok := x.Cmd.(*Command_Request); ok {
+			return x.Request
+		}
+	}
+	return nil
+}
+
 type isCommand_Cmd interface {
 	isCommand_Cmd()
 }
@@ -406,11 +432,210 @@ type Command_ExposeRule struct {
 	ExposeRule *ExposeRule `protobuf:"bytes,3,opt,name=expose_rule,json=exposeRule,proto3,oneof"` // add/remove a port-exposure rule
 }
 
+type Command_Request struct {
+	Request *AgentRequest `protobuf:"bytes,4,opt,name=request,proto3,oneof"` // generic API-driven request (containers/images/...)
+}
+
 func (*Command_OpenForward) isCommand_Cmd() {}
 
 func (*Command_DockerOp) isCommand_Cmd() {}
 
 func (*Command_ExposeRule) isCommand_Cmd() {}
+
+func (*Command_Request) isCommand_Cmd() {}
+
+// AgentRequest is the generic, method-dispatched request the controller drives
+// to an agent in response to an API call. The controller-side dispatch layer
+// (and the ControllerPeer relay hop) treat method/payload as opaque: method
+// names the operation (e.g. "containers.create", "images.list") and payload is
+// its method-specific body, carried as raw JSON. request_id correlates the
+// eventual AgentResult so a synchronous REST handler can await the reply.
+type AgentRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	RequestId     string                 `protobuf:"bytes,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	Method        string                 `protobuf:"bytes,2,opt,name=method,proto3" json:"method,omitempty"`
+	Payload       []byte                 `protobuf:"bytes,3,opt,name=payload,proto3" json:"payload,omitempty"` // method-specific request body, JSON-encoded
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *AgentRequest) Reset() {
+	*x = AgentRequest{}
+	mi := &file_hostlink_v1_hostlink_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AgentRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AgentRequest) ProtoMessage() {}
+
+func (x *AgentRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_hostlink_v1_hostlink_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AgentRequest.ProtoReflect.Descriptor instead.
+func (*AgentRequest) Descriptor() ([]byte, []int) {
+	return file_hostlink_v1_hostlink_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *AgentRequest) GetRequestId() string {
+	if x != nil {
+		return x.RequestId
+	}
+	return ""
+}
+
+func (x *AgentRequest) GetMethod() string {
+	if x != nil {
+		return x.Method
+	}
+	return ""
+}
+
+func (x *AgentRequest) GetPayload() []byte {
+	if x != nil {
+		return x.Payload
+	}
+	return nil
+}
+
+// AgentResult is the agent's reply to an AgentRequest, correlated by
+// request_id. code mirrors an HTTP status so the REST layer maps it back
+// directly; payload carries the method-specific result body (JSON) and error
+// holds a human-readable message when code indicates failure.
+type AgentResult struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	RequestId     string                 `protobuf:"bytes,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	Code          uint32                 `protobuf:"varint,2,opt,name=code,proto3" json:"code,omitempty"`
+	Payload       []byte                 `protobuf:"bytes,3,opt,name=payload,proto3" json:"payload,omitempty"` // method-specific result body, JSON-encoded
+	Error         string                 `protobuf:"bytes,4,opt,name=error,proto3" json:"error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *AgentResult) Reset() {
+	*x = AgentResult{}
+	mi := &file_hostlink_v1_hostlink_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AgentResult) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AgentResult) ProtoMessage() {}
+
+func (x *AgentResult) ProtoReflect() protoreflect.Message {
+	mi := &file_hostlink_v1_hostlink_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AgentResult.ProtoReflect.Descriptor instead.
+func (*AgentResult) Descriptor() ([]byte, []int) {
+	return file_hostlink_v1_hostlink_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *AgentResult) GetRequestId() string {
+	if x != nil {
+		return x.RequestId
+	}
+	return ""
+}
+
+func (x *AgentResult) GetCode() uint32 {
+	if x != nil {
+		return x.Code
+	}
+	return 0
+}
+
+func (x *AgentResult) GetPayload() []byte {
+	if x != nil {
+		return x.Payload
+	}
+	return nil
+}
+
+func (x *AgentResult) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
+// DispatchRequest wraps an AgentRequest with the agent_id routing key for the
+// ControllerPeer hop. The wrapped request travels unchanged to the agent; only
+// the relay needs the key to resolve the holding pod.
+type DispatchRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	AgentId       string                 `protobuf:"bytes,1,opt,name=agent_id,json=agentId,proto3" json:"agent_id,omitempty"`
+	Request       *AgentRequest          `protobuf:"bytes,2,opt,name=request,proto3" json:"request,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DispatchRequest) Reset() {
+	*x = DispatchRequest{}
+	mi := &file_hostlink_v1_hostlink_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DispatchRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DispatchRequest) ProtoMessage() {}
+
+func (x *DispatchRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_hostlink_v1_hostlink_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DispatchRequest.ProtoReflect.Descriptor instead.
+func (*DispatchRequest) Descriptor() ([]byte, []int) {
+	return file_hostlink_v1_hostlink_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *DispatchRequest) GetAgentId() string {
+	if x != nil {
+		return x.AgentId
+	}
+	return ""
+}
+
+func (x *DispatchRequest) GetRequest() *AgentRequest {
+	if x != nil {
+		return x.Request
+	}
+	return nil
+}
 
 // OpenForward instructs the agent to open a Forward stream for a pending public
 // connection identified by session_id, targeting a container-side address.
@@ -424,7 +649,7 @@ type OpenForward struct {
 
 func (x *OpenForward) Reset() {
 	*x = OpenForward{}
-	mi := &file_hostlink_v1_hostlink_proto_msgTypes[5]
+	mi := &file_hostlink_v1_hostlink_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -436,7 +661,7 @@ func (x *OpenForward) String() string {
 func (*OpenForward) ProtoMessage() {}
 
 func (x *OpenForward) ProtoReflect() protoreflect.Message {
-	mi := &file_hostlink_v1_hostlink_proto_msgTypes[5]
+	mi := &file_hostlink_v1_hostlink_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -449,7 +674,7 @@ func (x *OpenForward) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use OpenForward.ProtoReflect.Descriptor instead.
 func (*OpenForward) Descriptor() ([]byte, []int) {
-	return file_hostlink_v1_hostlink_proto_rawDescGZIP(), []int{5}
+	return file_hostlink_v1_hostlink_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *OpenForward) GetSessionId() string {
@@ -479,7 +704,7 @@ type DockerOp struct {
 
 func (x *DockerOp) Reset() {
 	*x = DockerOp{}
-	mi := &file_hostlink_v1_hostlink_proto_msgTypes[6]
+	mi := &file_hostlink_v1_hostlink_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -491,7 +716,7 @@ func (x *DockerOp) String() string {
 func (*DockerOp) ProtoMessage() {}
 
 func (x *DockerOp) ProtoReflect() protoreflect.Message {
-	mi := &file_hostlink_v1_hostlink_proto_msgTypes[6]
+	mi := &file_hostlink_v1_hostlink_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -504,7 +729,7 @@ func (x *DockerOp) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DockerOp.ProtoReflect.Descriptor instead.
 func (*DockerOp) Descriptor() ([]byte, []int) {
-	return file_hostlink_v1_hostlink_proto_rawDescGZIP(), []int{6}
+	return file_hostlink_v1_hostlink_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *DockerOp) GetOp() string {
@@ -540,7 +765,7 @@ type ExposeRule struct {
 
 func (x *ExposeRule) Reset() {
 	*x = ExposeRule{}
-	mi := &file_hostlink_v1_hostlink_proto_msgTypes[7]
+	mi := &file_hostlink_v1_hostlink_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -552,7 +777,7 @@ func (x *ExposeRule) String() string {
 func (*ExposeRule) ProtoMessage() {}
 
 func (x *ExposeRule) ProtoReflect() protoreflect.Message {
-	mi := &file_hostlink_v1_hostlink_proto_msgTypes[7]
+	mi := &file_hostlink_v1_hostlink_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -565,7 +790,7 @@ func (x *ExposeRule) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExposeRule.ProtoReflect.Descriptor instead.
 func (*ExposeRule) Descriptor() ([]byte, []int) {
-	return file_hostlink_v1_hostlink_proto_rawDescGZIP(), []int{7}
+	return file_hostlink_v1_hostlink_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *ExposeRule) GetContainerTarget() string {
@@ -603,7 +828,7 @@ type Frame struct {
 
 func (x *Frame) Reset() {
 	*x = Frame{}
-	mi := &file_hostlink_v1_hostlink_proto_msgTypes[8]
+	mi := &file_hostlink_v1_hostlink_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -615,7 +840,7 @@ func (x *Frame) String() string {
 func (*Frame) ProtoMessage() {}
 
 func (x *Frame) ProtoReflect() protoreflect.Message {
-	mi := &file_hostlink_v1_hostlink_proto_msgTypes[8]
+	mi := &file_hostlink_v1_hostlink_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -628,7 +853,7 @@ func (x *Frame) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Frame.ProtoReflect.Descriptor instead.
 func (*Frame) Descriptor() ([]byte, []int) {
-	return file_hostlink_v1_hostlink_proto_rawDescGZIP(), []int{8}
+	return file_hostlink_v1_hostlink_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *Frame) GetSessionId() string {
@@ -656,26 +881,42 @@ var File_hostlink_v1_hostlink_proto protoreflect.FileDescriptor
 
 const file_hostlink_v1_hostlink_proto_rawDesc = "" +
 	"\n" +
-	"\x1ahostlink/v1/hostlink.proto\x12\vhostlink.v1\"\xc5\x01\n" +
+	"\x1ahostlink/v1/hostlink.proto\x12\vhostlink.v1\"\xf9\x01\n" +
 	"\n" +
 	"AgentEvent\x12\x19\n" +
 	"\bagent_id\x18\x01 \x01(\tR\aagentId\x12*\n" +
 	"\x05hello\x18\x02 \x01(\v2\x12.hostlink.v1.HelloH\x00R\x05hello\x126\n" +
 	"\theartbeat\x18\x03 \x01(\v2\x16.hostlink.v1.HeartbeatH\x00R\theartbeat\x120\n" +
-	"\x05event\x18\x04 \x01(\v2\x18.hostlink.v1.DockerEventH\x00R\x05eventB\x06\n" +
+	"\x05event\x18\x04 \x01(\v2\x18.hostlink.v1.DockerEventH\x00R\x05event\x122\n" +
+	"\x06result\x18\x05 \x01(\v2\x18.hostlink.v1.AgentResultH\x00R\x06resultB\x06\n" +
 	"\x04kind\"\x1d\n" +
 	"\x05Hello\x12\x14\n" +
 	"\x05token\x18\x01 \x01(\tR\x05token\"\v\n" +
 	"\tHeartbeat\"D\n" +
 	"\vDockerEvent\x12\x12\n" +
 	"\x04type\x18\x01 \x01(\tR\x04type\x12!\n" +
-	"\fcontainer_id\x18\x02 \x01(\tR\vcontainerId\"\xc1\x01\n" +
+	"\fcontainer_id\x18\x02 \x01(\tR\vcontainerId\"\xf8\x01\n" +
 	"\aCommand\x12=\n" +
 	"\fopen_forward\x18\x01 \x01(\v2\x18.hostlink.v1.OpenForwardH\x00R\vopenForward\x124\n" +
 	"\tdocker_op\x18\x02 \x01(\v2\x15.hostlink.v1.DockerOpH\x00R\bdockerOp\x12:\n" +
 	"\vexpose_rule\x18\x03 \x01(\v2\x17.hostlink.v1.ExposeRuleH\x00R\n" +
-	"exposeRuleB\x05\n" +
-	"\x03cmd\"D\n" +
+	"exposeRule\x125\n" +
+	"\arequest\x18\x04 \x01(\v2\x19.hostlink.v1.AgentRequestH\x00R\arequestB\x05\n" +
+	"\x03cmd\"_\n" +
+	"\fAgentRequest\x12\x1d\n" +
+	"\n" +
+	"request_id\x18\x01 \x01(\tR\trequestId\x12\x16\n" +
+	"\x06method\x18\x02 \x01(\tR\x06method\x12\x18\n" +
+	"\apayload\x18\x03 \x01(\fR\apayload\"p\n" +
+	"\vAgentResult\x12\x1d\n" +
+	"\n" +
+	"request_id\x18\x01 \x01(\tR\trequestId\x12\x12\n" +
+	"\x04code\x18\x02 \x01(\rR\x04code\x12\x18\n" +
+	"\apayload\x18\x03 \x01(\fR\apayload\x12\x14\n" +
+	"\x05error\x18\x04 \x01(\tR\x05error\"a\n" +
+	"\x0fDispatchRequest\x12\x19\n" +
+	"\bagent_id\x18\x01 \x01(\tR\aagentId\x123\n" +
+	"\arequest\x18\x02 \x01(\v2\x19.hostlink.v1.AgentRequestR\arequest\"D\n" +
 	"\vOpenForward\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x12\x16\n" +
@@ -702,7 +943,9 @@ const file_hostlink_v1_hostlink_proto_rawDesc = "" +
 	"\x05RESET\x10\x022\x80\x01\n" +
 	"\tAgentLink\x12<\n" +
 	"\aControl\x12\x17.hostlink.v1.AgentEvent\x1a\x14.hostlink.v1.Command(\x010\x01\x125\n" +
-	"\aForward\x12\x12.hostlink.v1.Frame\x1a\x12.hostlink.v1.Frame(\x010\x01B?Z=github.com/humble-mun/hostlink/pkg/api/hostlink/v1;hostlinkv1b\x06proto3"
+	"\aForward\x12\x12.hostlink.v1.Frame\x1a\x12.hostlink.v1.Frame(\x010\x012T\n" +
+	"\x0eControllerPeer\x12B\n" +
+	"\bDispatch\x12\x1c.hostlink.v1.DispatchRequest\x1a\x18.hostlink.v1.AgentResultB?Z=github.com/humble-mun/hostlink/pkg/api/hostlink/v1;hostlinkv1b\x06proto3"
 
 var (
 	file_hostlink_v1_hostlink_proto_rawDescOnce sync.Once
@@ -717,36 +960,44 @@ func file_hostlink_v1_hostlink_proto_rawDescGZIP() []byte {
 }
 
 var file_hostlink_v1_hostlink_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_hostlink_v1_hostlink_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
+var file_hostlink_v1_hostlink_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
 var file_hostlink_v1_hostlink_proto_goTypes = []any{
-	(Frame_Type)(0),     // 0: hostlink.v1.Frame.Type
-	(*AgentEvent)(nil),  // 1: hostlink.v1.AgentEvent
-	(*Hello)(nil),       // 2: hostlink.v1.Hello
-	(*Heartbeat)(nil),   // 3: hostlink.v1.Heartbeat
-	(*DockerEvent)(nil), // 4: hostlink.v1.DockerEvent
-	(*Command)(nil),     // 5: hostlink.v1.Command
-	(*OpenForward)(nil), // 6: hostlink.v1.OpenForward
-	(*DockerOp)(nil),    // 7: hostlink.v1.DockerOp
-	(*ExposeRule)(nil),  // 8: hostlink.v1.ExposeRule
-	(*Frame)(nil),       // 9: hostlink.v1.Frame
+	(Frame_Type)(0),         // 0: hostlink.v1.Frame.Type
+	(*AgentEvent)(nil),      // 1: hostlink.v1.AgentEvent
+	(*Hello)(nil),           // 2: hostlink.v1.Hello
+	(*Heartbeat)(nil),       // 3: hostlink.v1.Heartbeat
+	(*DockerEvent)(nil),     // 4: hostlink.v1.DockerEvent
+	(*Command)(nil),         // 5: hostlink.v1.Command
+	(*AgentRequest)(nil),    // 6: hostlink.v1.AgentRequest
+	(*AgentResult)(nil),     // 7: hostlink.v1.AgentResult
+	(*DispatchRequest)(nil), // 8: hostlink.v1.DispatchRequest
+	(*OpenForward)(nil),     // 9: hostlink.v1.OpenForward
+	(*DockerOp)(nil),        // 10: hostlink.v1.DockerOp
+	(*ExposeRule)(nil),      // 11: hostlink.v1.ExposeRule
+	(*Frame)(nil),           // 12: hostlink.v1.Frame
 }
 var file_hostlink_v1_hostlink_proto_depIdxs = []int32{
-	2, // 0: hostlink.v1.AgentEvent.hello:type_name -> hostlink.v1.Hello
-	3, // 1: hostlink.v1.AgentEvent.heartbeat:type_name -> hostlink.v1.Heartbeat
-	4, // 2: hostlink.v1.AgentEvent.event:type_name -> hostlink.v1.DockerEvent
-	6, // 3: hostlink.v1.Command.open_forward:type_name -> hostlink.v1.OpenForward
-	7, // 4: hostlink.v1.Command.docker_op:type_name -> hostlink.v1.DockerOp
-	8, // 5: hostlink.v1.Command.expose_rule:type_name -> hostlink.v1.ExposeRule
-	0, // 6: hostlink.v1.Frame.type:type_name -> hostlink.v1.Frame.Type
-	1, // 7: hostlink.v1.AgentLink.Control:input_type -> hostlink.v1.AgentEvent
-	9, // 8: hostlink.v1.AgentLink.Forward:input_type -> hostlink.v1.Frame
-	5, // 9: hostlink.v1.AgentLink.Control:output_type -> hostlink.v1.Command
-	9, // 10: hostlink.v1.AgentLink.Forward:output_type -> hostlink.v1.Frame
-	9, // [9:11] is the sub-list for method output_type
-	7, // [7:9] is the sub-list for method input_type
-	7, // [7:7] is the sub-list for extension type_name
-	7, // [7:7] is the sub-list for extension extendee
-	0, // [0:7] is the sub-list for field type_name
+	2,  // 0: hostlink.v1.AgentEvent.hello:type_name -> hostlink.v1.Hello
+	3,  // 1: hostlink.v1.AgentEvent.heartbeat:type_name -> hostlink.v1.Heartbeat
+	4,  // 2: hostlink.v1.AgentEvent.event:type_name -> hostlink.v1.DockerEvent
+	7,  // 3: hostlink.v1.AgentEvent.result:type_name -> hostlink.v1.AgentResult
+	9,  // 4: hostlink.v1.Command.open_forward:type_name -> hostlink.v1.OpenForward
+	10, // 5: hostlink.v1.Command.docker_op:type_name -> hostlink.v1.DockerOp
+	11, // 6: hostlink.v1.Command.expose_rule:type_name -> hostlink.v1.ExposeRule
+	6,  // 7: hostlink.v1.Command.request:type_name -> hostlink.v1.AgentRequest
+	6,  // 8: hostlink.v1.DispatchRequest.request:type_name -> hostlink.v1.AgentRequest
+	0,  // 9: hostlink.v1.Frame.type:type_name -> hostlink.v1.Frame.Type
+	1,  // 10: hostlink.v1.AgentLink.Control:input_type -> hostlink.v1.AgentEvent
+	12, // 11: hostlink.v1.AgentLink.Forward:input_type -> hostlink.v1.Frame
+	8,  // 12: hostlink.v1.ControllerPeer.Dispatch:input_type -> hostlink.v1.DispatchRequest
+	5,  // 13: hostlink.v1.AgentLink.Control:output_type -> hostlink.v1.Command
+	12, // 14: hostlink.v1.AgentLink.Forward:output_type -> hostlink.v1.Frame
+	7,  // 15: hostlink.v1.ControllerPeer.Dispatch:output_type -> hostlink.v1.AgentResult
+	13, // [13:16] is the sub-list for method output_type
+	10, // [10:13] is the sub-list for method input_type
+	10, // [10:10] is the sub-list for extension type_name
+	10, // [10:10] is the sub-list for extension extendee
+	0,  // [0:10] is the sub-list for field type_name
 }
 
 func init() { file_hostlink_v1_hostlink_proto_init() }
@@ -758,11 +1009,13 @@ func file_hostlink_v1_hostlink_proto_init() {
 		(*AgentEvent_Hello)(nil),
 		(*AgentEvent_Heartbeat)(nil),
 		(*AgentEvent_Event)(nil),
+		(*AgentEvent_Result)(nil),
 	}
 	file_hostlink_v1_hostlink_proto_msgTypes[4].OneofWrappers = []any{
 		(*Command_OpenForward)(nil),
 		(*Command_DockerOp)(nil),
 		(*Command_ExposeRule)(nil),
+		(*Command_Request)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
@@ -770,9 +1023,9 @@ func file_hostlink_v1_hostlink_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_hostlink_v1_hostlink_proto_rawDesc), len(file_hostlink_v1_hostlink_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   9,
+			NumMessages:   12,
 			NumExtensions: 0,
-			NumServices:   1,
+			NumServices:   2,
 		},
 		GoTypes:           file_hostlink_v1_hostlink_proto_goTypes,
 		DependencyIndexes: file_hostlink_v1_hostlink_proto_depIdxs,

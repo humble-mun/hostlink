@@ -169,3 +169,129 @@ var AgentLink_ServiceDesc = grpc.ServiceDesc{
 	},
 	Metadata: "hostlink/v1/hostlink.proto",
 }
+
+const (
+	ControllerPeer_Dispatch_FullMethodName = "/hostlink.v1.ControllerPeer/Dispatch"
+)
+
+// ControllerPeerClient is the client API for ControllerPeer service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// ControllerPeer is the controller<->controller (sibling pod) plane. An agent
+// pins its Control stream to the one pod it dialed, but an API request (e.g.
+// REST POST /agents/<id>/containers) can land on any replica behind the L4 LB.
+// A pod that receives a request for an agent it does not hold relays it here to
+// the holding pod (resolved via the Redis agent->pod registry); the holding pod
+// drives the request over that agent's Control stream and returns the result.
+type ControllerPeerClient interface {
+	// Dispatch relays a single agent-targeted request to the holding pod. It is a
+	// pure routing hop and does not interpret the request: method/payload are
+	// opaque and travel unchanged to the agent. A pod that no longer holds the
+	// agent (the mapping went stale) rejects with FAILED_PRECONDITION so the
+	// caller re-resolves and retries.
+	Dispatch(ctx context.Context, in *DispatchRequest, opts ...grpc.CallOption) (*AgentResult, error)
+}
+
+type controllerPeerClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewControllerPeerClient(cc grpc.ClientConnInterface) ControllerPeerClient {
+	return &controllerPeerClient{cc}
+}
+
+func (c *controllerPeerClient) Dispatch(ctx context.Context, in *DispatchRequest, opts ...grpc.CallOption) (*AgentResult, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AgentResult)
+	err := c.cc.Invoke(ctx, ControllerPeer_Dispatch_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ControllerPeerServer is the server API for ControllerPeer service.
+// All implementations must embed UnimplementedControllerPeerServer
+// for forward compatibility.
+//
+// ControllerPeer is the controller<->controller (sibling pod) plane. An agent
+// pins its Control stream to the one pod it dialed, but an API request (e.g.
+// REST POST /agents/<id>/containers) can land on any replica behind the L4 LB.
+// A pod that receives a request for an agent it does not hold relays it here to
+// the holding pod (resolved via the Redis agent->pod registry); the holding pod
+// drives the request over that agent's Control stream and returns the result.
+type ControllerPeerServer interface {
+	// Dispatch relays a single agent-targeted request to the holding pod. It is a
+	// pure routing hop and does not interpret the request: method/payload are
+	// opaque and travel unchanged to the agent. A pod that no longer holds the
+	// agent (the mapping went stale) rejects with FAILED_PRECONDITION so the
+	// caller re-resolves and retries.
+	Dispatch(context.Context, *DispatchRequest) (*AgentResult, error)
+	mustEmbedUnimplementedControllerPeerServer()
+}
+
+// UnimplementedControllerPeerServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedControllerPeerServer struct{}
+
+func (UnimplementedControllerPeerServer) Dispatch(context.Context, *DispatchRequest) (*AgentResult, error) {
+	return nil, status.Error(codes.Unimplemented, "method Dispatch not implemented")
+}
+func (UnimplementedControllerPeerServer) mustEmbedUnimplementedControllerPeerServer() {}
+func (UnimplementedControllerPeerServer) testEmbeddedByValue()                        {}
+
+// UnsafeControllerPeerServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to ControllerPeerServer will
+// result in compilation errors.
+type UnsafeControllerPeerServer interface {
+	mustEmbedUnimplementedControllerPeerServer()
+}
+
+func RegisterControllerPeerServer(s grpc.ServiceRegistrar, srv ControllerPeerServer) {
+	// If the following call panics, it indicates UnimplementedControllerPeerServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&ControllerPeer_ServiceDesc, srv)
+}
+
+func _ControllerPeer_Dispatch_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DispatchRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControllerPeerServer).Dispatch(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControllerPeer_Dispatch_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControllerPeerServer).Dispatch(ctx, req.(*DispatchRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// ControllerPeer_ServiceDesc is the grpc.ServiceDesc for ControllerPeer service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var ControllerPeer_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "hostlink.v1.ControllerPeer",
+	HandlerType: (*ControllerPeerServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "Dispatch",
+			Handler:    _ControllerPeer_Dispatch_Handler,
+		},
+	},
+	Streams:  []grpc.StreamDesc{},
+	Metadata: "hostlink/v1/hostlink.proto",
+}

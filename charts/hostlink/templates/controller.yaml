@@ -1,5 +1,31 @@
 {{- $grpcPort := last (splitList ":" .Values.grpc.bindAddress) }}
 {{- $httpPort := last (splitList ":" .Values.http.bindAddress) }}
+{{- $peerPort := last (splitList ":" .Values.peer.bindAddress) }}
+{{- $peerEnabled := .Values.peer.enabled }}
+{{- /* Multiple replicas need the cross-pod relay, which requires both the redis
+       agent->pod directory and the peer mTLS plane. Fail fast at install/upgrade
+       rather than silently 404 for agents held by sibling pods at runtime. */}}
+{{- if gt (int .Values.replicaCount) 1 }}
+{{- if or (not .Values.redis.url) (not $peerEnabled) }}
+{{- fail "replicaCount > 1 requires both redis.url and peer.enabled (cross-pod relay). Set both, or run a single replica." }}
+{{- end }}
+{{- end }}
+{{- /* Certificate source must be fully specified for whichever planes are active. */}}
+{{- if .Values.certManager.enabled }}
+{{- if not .Values.certManager.issuerName }}
+{{- fail "certManager.enabled requires certManager.issuerName." }}
+{{- end }}
+{{- if not .Values.grpc.dnsNames }}
+{{- fail "certManager.enabled requires grpc.dnsNames (the SANs agents verify the controller against)." }}
+{{- end }}
+{{- else }}
+{{- if not .Values.grpc.tlsSecretName }}
+{{- fail "grpc.tlsSecretName is required when certManager.enabled is false." }}
+{{- end }}
+{{- if and $peerEnabled (not .Values.peer.tlsSecretName) }}
+{{- fail "peer.tlsSecretName is required when peer.enabled and certManager.enabled is false." }}
+{{- end }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -21,15 +47,40 @@ data:
     grpc-tls-cert-path: {{ .Values.grpc.tlsCertPath }}
     grpc-tls-key-path: {{ .Values.grpc.tlsKeyPath }}
     grpc-tls-ca-path: {{ .Values.grpc.tlsCAPath }}
+    # Cross-pod agent registry. Empty url => in-memory single-replica mode.
+    redis-url: {{ .Values.redis.url | quote }}
+    {{- if $peerEnabled }}
+    # ControllerPeer plane (cross-pod relay). The advertise address is built from
+    # the pod's DNS at runtime via HM_PEER_ADVERTISE_ADDRESS, not set here.
+    peer-bind-address: {{ .Values.peer.bindAddress }}
+    peer-tls-cert-path: {{ .Values.peer.tlsCertPath }}
+    peer-tls-key-path: {{ .Values.peer.tlsKeyPath }}
+    peer-tls-ca-path: {{ .Values.peer.tlsCAPath }}
+    {{- end }}
 ---
+# ---------------------------------------------------------------------------
+# Controller workload: a StatefulSet (not a Deployment) so each pod gets a
+# stable ordinal name ({{ .Release.Name }}-0, -1, ...) and stable per-pod DNS
+# via the headless Service ({{ .Release.Name }}-peer). This matters for the
+# controller<->controller (ControllerPeer) plane: the Redis agent->pod registry
+# stores the holding pod's stable identity, and a sibling that receives an API
+# request for an agent it does not hold dials the holder directly at
+# <pod>.{{ .Release.Name }}-peer.<ns>.svc:<peerPort>. With a Deployment the pod
+# name/IP churn on restart and there is no stable per-pod address to dial.
+# This is for network identity only -- the controller keeps no durable local
+# state (the registry lives in Redis), so no volumeClaimTemplates are needed.
+# podManagementPolicy: Parallel because pods have no startup ordering dependency.
+# ---------------------------------------------------------------------------
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: {{ .Release.Name }}
   namespace: {{ .Release.Namespace }}
   labels:
     app: {{ .Release.Name }}
 spec:
+  serviceName: {{ .Release.Name }}-peer
+  podManagementPolicy: Parallel
   replicas: {{ .Values.replicaCount }}
   selector:
     matchLabels:
@@ -69,6 +120,29 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: spec.nodeName
+        # Stable self-identity for the ControllerPeer plane: the pod writes its
+        # own name as the holding-pod value in the Redis agent->pod registry, and
+        # siblings dial it back at $(POD_NAME).$(POD_PEER_SERVICE).$(POD_NAMESPACE)
+        # .svc:<peerPort>. Plain (non-HM_) names so chassis does not bind them as
+        # flags. Consumed once the ControllerPeer service is wired in.
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: POD_PEER_SERVICE
+          value: {{ .Release.Name }}-peer
+        {{- if $peerEnabled }}
+        # HM_-prefixed so chassis binds it to --peer-advertise-address. k8s expands
+        # the $(POD_*) refs (defined above) into this pod's stable headless DNS,
+        # which siblings dial for cross-pod relay and which is written as the
+        # holding-pod value in the Redis agent->pod registry.
+        - name: HM_PEER_ADVERTISE_ADDRESS
+          value: $(POD_NAME).$(POD_PEER_SERVICE).$(POD_NAMESPACE).svc:{{ $peerPort }}
+        {{- end }}
         ports:
         # In-cluster plaintext listener (metrics / probe / version / logging).
         - name: http
@@ -77,6 +151,13 @@ spec:
         # Agent-facing mTLS gRPC listener.
         - name: grpc
           containerPort: {{ $grpcPort }}
+          protocol: TCP
+        # Controller<->controller (ControllerPeer) mTLS listener. Reached only
+        # in-cluster via the headless Service per-pod DNS; never exposed through
+        # the ingress. Declared here as forward-prep -- nothing binds it until
+        # the ControllerPeer service lands.
+        - name: peer
+          containerPort: {{ $peerPort }}
           protocol: TCP
         volumeMounts:
         # viper config file mounted as a single file via subPath.
@@ -88,6 +169,12 @@ spec:
         - name: grpc-pki
           mountPath: /etc/humble-mun/controller
           readOnly: true
+        {{- if $peerEnabled }}
+        # ControllerPeer mTLS cert/key + peer CA bundle (in-cluster only).
+        - name: peer-pki
+          mountPath: /etc/humble-mun/controller-peer
+          readOnly: true
+        {{- end }}
         resources:
           {{- toYaml .Values.resources | nindent 10 }}
         # Probes hit the in-cluster plaintext default listener on 8080.
@@ -120,10 +207,16 @@ spec:
       - name: config
         configMap:
           name: {{ .Release.Name }}
-      # mTLS material for the agent-facing gRPC listener.
+      # mTLS material for the agent-facing gRPC listener (cert-manager CSI or Secret).
       - name: grpc-pki
-        secret:
-          secretName: {{ .Values.grpc.tlsSecretName }}
+        {{- include "hostlink.certVolumeSource" (dict "root" $ "secretName" .Values.grpc.tlsSecretName "dnsNames" (join "," .Values.grpc.dnsNames)) | nindent 8 }}
+      {{- if $peerEnabled }}
+      # mTLS material for the in-cluster ControllerPeer plane. In cert-manager mode
+      # the SANs carry this pod's own headless DNS so siblings can verify it; the
+      # CSI driver expands ${POD_NAME}/${POD_NAMESPACE} per pod.
+      - name: peer-pki
+        {{- include "hostlink.certVolumeSource" (dict "root" $ "secretName" .Values.peer.tlsSecretName "dnsNames" (printf "${POD_NAME}.%s-peer.${POD_NAMESPACE}.svc,${POD_NAME}.%s-peer.${POD_NAMESPACE}.svc.cluster.local" .Release.Name .Release.Name)) | nindent 8 }}
+      {{- end }}
 ---
 {{- if .Values.ingress.host }}
 # ---------------------------------------------------------------------------

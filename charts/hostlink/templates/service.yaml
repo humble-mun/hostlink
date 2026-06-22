@@ -1,11 +1,12 @@
 {{- $grpcPort := last (splitList ":" .Values.grpc.bindAddress) }}
 {{- $httpPort := last (splitList ":" .Values.http.bindAddress) }}
+{{- $peerPort := last (splitList ":" .Values.peer.bindAddress) }}
 # ---------------------------------------------------------------------------
 # Service. Carries BOTH ports:
 #   - grpc: agent-facing mTLS listener, exposed externally through the ingress.
 #     The controller terminates mTLS itself, so traffic must reach it as raw
 #     TCP (the ingress does L4/TLS passthrough -- see the Ingress in
-#     templates/deployment.yaml).
+#     templates/controller.yaml).
 #   - http: in-cluster plaintext default listener (metrics/probe/version/
 #     logging). Never exposed through the ingress; kept here so Prometheus and
 #     in-cluster clients reach /metrics via this ClusterIP. The metrics fan-out
@@ -31,4 +32,35 @@ spec:
   - name: http
     port: {{ $httpPort }}
     targetPort: http
+    protocol: TCP
+---
+# ---------------------------------------------------------------------------
+# Headless Service for the StatefulSet: gives every pod stable per-pod DNS
+# ({{ .Release.Name }}-0.{{ .Release.Name }}-peer.<ns>.svc, ...). This is what
+# the ControllerPeer plane dials -- a sibling that receives an API request for
+# an agent it does not hold resolves the holding pod from the Redis registry and
+# dials it directly here. clusterIP: None so DNS returns the individual pod A
+# records rather than a single virtual IP (no load balancing -- we target a
+# specific pod). The load-balanced ClusterIP above stays for agent gRPC and the
+# stateless metrics fan-out; this headless one is for pod-to-pod addressing.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-peer
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Release.Name }}
+spec:
+  clusterIP: None
+  # Resolve peers by DNS as soon as they are scheduled, before readiness: the
+  # agent->pod mapping is only written after a pod is up and holding agents, so
+  # a name in the registry already implies a reachable pod.
+  publishNotReadyAddresses: true
+  selector:
+    app: {{ .Release.Name }}
+  ports:
+  - name: peer
+    port: {{ $peerPort }}
+    targetPort: peer
     protocol: TCP

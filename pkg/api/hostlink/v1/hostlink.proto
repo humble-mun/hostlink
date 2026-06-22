@@ -21,6 +21,21 @@ service AgentLink {
   rpc Forward(stream Frame) returns (stream Frame);
 }
 
+// ControllerPeer is the controller<->controller (sibling pod) plane. An agent
+// pins its Control stream to the one pod it dialed, but an API request (e.g.
+// REST POST /agents/<id>/containers) can land on any replica behind the L4 LB.
+// A pod that receives a request for an agent it does not hold relays it here to
+// the holding pod (resolved via the Redis agent->pod registry); the holding pod
+// drives the request over that agent's Control stream and returns the result.
+service ControllerPeer {
+  // Dispatch relays a single agent-targeted request to the holding pod. It is a
+  // pure routing hop and does not interpret the request: method/payload are
+  // opaque and travel unchanged to the agent. A pod that no longer holds the
+  // agent (the mapping went stale) rejects with FAILED_PRECONDITION so the
+  // caller re-resolves and retries.
+  rpc Dispatch(DispatchRequest) returns (AgentResult);
+}
+
 // AgentEvent is the agent->controller direction of the Control stream.
 message AgentEvent {
   string agent_id = 1;
@@ -28,6 +43,7 @@ message AgentEvent {
     Hello hello = 2;          // initial handshake: auth, capability declaration
     Heartbeat heartbeat = 3;  // refresh the TTL of the agent->pod mapping in Redis
     DockerEvent event = 4;    // container start/stop/die reports
+    AgentResult result = 5;   // reply to a controller->agent AgentRequest
   }
 }
 
@@ -49,10 +65,42 @@ message DockerEvent {
 // Command is the controller->agent direction of the Control stream.
 message Command {
   oneof cmd {
-    OpenForward open_forward = 1; // tell the agent to open a Forward stream for a session
-    DockerOp    docker_op    = 2; // run/stop/start/pause/unpause/rm
-    ExposeRule  expose_rule  = 3; // add/remove a port-exposure rule
+    OpenForward  open_forward = 1; // tell the agent to open a Forward stream for a session
+    DockerOp     docker_op    = 2; // run/stop/start/pause/unpause/rm
+    ExposeRule   expose_rule  = 3; // add/remove a port-exposure rule
+    AgentRequest request      = 4; // generic API-driven request (containers/images/...)
   }
+}
+
+// AgentRequest is the generic, method-dispatched request the controller drives
+// to an agent in response to an API call. The controller-side dispatch layer
+// (and the ControllerPeer relay hop) treat method/payload as opaque: method
+// names the operation (e.g. "containers.create", "images.list") and payload is
+// its method-specific body, carried as raw JSON. request_id correlates the
+// eventual AgentResult so a synchronous REST handler can await the reply.
+message AgentRequest {
+  string request_id = 1;
+  string method = 2;
+  bytes  payload = 3; // method-specific request body, JSON-encoded
+}
+
+// AgentResult is the agent's reply to an AgentRequest, correlated by
+// request_id. code mirrors an HTTP status so the REST layer maps it back
+// directly; payload carries the method-specific result body (JSON) and error
+// holds a human-readable message when code indicates failure.
+message AgentResult {
+  string request_id = 1;
+  uint32 code = 2;
+  bytes  payload = 3; // method-specific result body, JSON-encoded
+  string error = 4;
+}
+
+// DispatchRequest wraps an AgentRequest with the agent_id routing key for the
+// ControllerPeer hop. The wrapped request travels unchanged to the agent; only
+// the relay needs the key to resolve the holding pod.
+message DispatchRequest {
+  string agent_id = 1;
+  AgentRequest request = 2;
 }
 
 // OpenForward instructs the agent to open a Forward stream for a pending public

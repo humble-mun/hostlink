@@ -1,15 +1,11 @@
 package main
 
 import (
-	"context"
-
-	"github.com/go-logr/logr"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
 
 	"github.com/humble-mun/chassis/pkg/app"
 	"github.com/humble-mun/chassis/pkg/metrics"
-	"github.com/humble-mun/chassis/pkg/server"
 	"github.com/humble-mun/chassis/pkg/version"
 
 	"github.com/humble-mun/hostlink/pkg/controller"
@@ -33,40 +29,36 @@ func newRootCommand() *cobra.Command {
 		SilenceUsage: true,
 		RunE: func(_ *cobra.Command, _ []string) (err error) {
 			srv := grpc.NewServer()
-			var rootLogger, logger logr.Logger
-			var httpGin *server.HTTPServer
-			var ctx context.Context
-			var nodeName string
-			if rootLogger, logger, httpGin, ctx, nodeName, err = app.BaseContext(
+			var base app.Base
+			if base, err = app.BaseContext(
 				app.WithInit(init),
 				app.WithGRPCServer(srv),
 				app.WithTCPListener(controller.ListenerOptions()...),
 			); err != nil {
 				return
 			}
-			logger = logger.WithValues("nodeName", nodeName)
 
 			var svc controller.Service
-			if svc, err = controller.RegisterGRPCService(rootLogger, nodeName, srv); err != nil {
-				logger.Error(err, "register controller grpc service failed")
+			if svc, err = controller.RegisterGRPCService(base.RootLogger, base.NodeName, srv); err != nil {
+				base.Logger.Error(err, "register controller grpc service failed")
 				return
 			}
 			defer func() {
 				if e := svc.Close(); e != nil {
-					logger.Error(e, "close controller grpc service failed")
+					base.Logger.Error(e, "close controller grpc service failed")
 				}
 			}()
 
-			httpGin.RegisterRoute(svc.RegisterRoute)
+			base.HTTPGin.RegisterRoute(svc.RegisterRoute)
 			metrics.RegisterScrapeHook(svc.RegisterScrapeHook)
 
-			logger.Info("controller started")
-			defer logger.Info("controller finished")
-			if err = httpGin.Start(ctx); err != nil {
-				logger.Error(err, "start http server failed")
+			base.Logger.Info("controller started")
+			defer base.Logger.Info("controller finished")
+			if err = base.HTTPGin.Start(base.Ctx); err != nil {
+				base.Logger.Error(err, "start http server failed")
 				return
 			}
-			<-ctx.Done()
+			<-base.Ctx.Done()
 			return
 		},
 	}

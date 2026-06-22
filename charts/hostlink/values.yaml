@@ -3,11 +3,13 @@
 # ---------------------------------------------------------------------------
 image: harbor-c0a811fc.nip.io/humble-mun/hostlink-controller:v0.1.0
 
-# replicaCount is the number of controller pods. The controller is designed to
-# run with >=2 replicas for HA: each agent pins its connection to the one pod it
-# dialed, and public TCP forwarded through the L4 LB lands on any replica, so
-# multiple replicas are required for the cross-pod routing path to be exercised.
-replicaCount: 2
+# replicaCount is the number of controller pods, running as a StatefulSet so each
+# pod gets a stable ordinal name + per-pod DNS via the headless Service. Default 1
+# works out of the box (in-memory registry, no redis needed). For HA set it >1:
+# each agent pins its connection to the one pod it dialed while API requests land
+# on any replica, so >1 replicas exercise the cross-pod routing path and therefore
+# REQUIRE both redis.url and peer.tlsSecretName (enforced at install/upgrade).
+replicaCount: 1
 
 # ---------------------------------------------------------------------------
 # mTLS gRPC listener (agent connections)
@@ -33,9 +35,93 @@ grpc:
   tlsCAPath: /etc/humble-mun/controller/ca.crt
 
   # tlsSecretName is the Secret (type kubernetes.io/tls or opaque) holding the
-  # server cert/key and CA bundle mounted at /etc/humble-mun/controller. Required:
-  # there is no insecure fallback, so the pod will not serve agents without it.
+  # server cert/key and CA bundle mounted at /etc/humble-mun/controller. Used only
+  # when certManager.enabled is false (otherwise cert-manager issues the cert via
+  # the CSI driver). There is no insecure fallback, so the pod will not serve
+  # agents without one of the two sources.
   tlsSecretName: hostlink-controller-grpc-tls
+
+  # dnsNames are the SANs cert-manager puts on the agent-facing server certificate
+  # (used only when certManager.enabled). Must include whatever agents verify
+  # against -- i.e. their --controller-tls-server-name, typically the ingress host.
+  dnsNames: []
+
+# ---------------------------------------------------------------------------
+# ControllerPeer listener (controller <-> controller, in-cluster only)
+# ---------------------------------------------------------------------------
+# The pod-to-pod plane: a replica that receives an API request for an agent it
+# does not hold relays it (ControllerPeer.Dispatch) to the holding pod, dialed
+# via the headless Service per-pod DNS. Reachable only in-cluster and never
+# exposed through the ingress. Like the agent listener it is intended to be
+# mTLS (controller certs) consistent with the mTLS-everywhere model. This is
+# forward-prep: the chart wires the port + headless DNS, but nothing binds the
+# listener until the ControllerPeer service is implemented.
+peer:
+  # enabled turns on the ControllerPeer cross-pod relay plane: the listener is
+  # bound and a request for an agent held by a sibling is relayed to it. Off
+  # DISABLES the plane (such a request returns 404). Required together with
+  # redis.url whenever replicaCount > 1.
+  enabled: false
+
+  # bindAddress is the host:port the ControllerPeer mTLS listener binds.
+  bindAddress: "0.0.0.0:8444"
+
+  # tlsSecretName is the Secret holding the controller cert/key + peer CA bundle
+  # for the ControllerPeer plane (the controller is both server and client here).
+  # Used only when certManager.enabled is false; otherwise cert-manager issues a
+  # per-pod cert via the CSI driver.
+  tlsSecretName: ""
+
+  # tlsCertPath / tlsKeyPath / tlsCAPath are the in-container paths the peer cert
+  # material is mounted at. Maps to --peer-tls-cert-path / --peer-tls-key-path /
+  # --peer-tls-ca-path.
+  tlsCertPath: /etc/humble-mun/controller-peer/tls.crt
+  tlsKeyPath:  /etc/humble-mun/controller-peer/tls.key
+  tlsCAPath:   /etc/humble-mun/controller-peer/ca.crt
+
+# ---------------------------------------------------------------------------
+# Redis (cross-pod agent registry)
+# ---------------------------------------------------------------------------
+# Backs the agent->pod mapping the ControllerPeer plane resolves against. Empty
+# keeps the registry in-memory (single replica / dev): a request for an agent
+# held by another replica returns 404. Cross-pod relay needs BOTH redis.url and
+# peer.enabled set.
+redis:
+  # url is the connection URL, e.g. redis://:password@hostlink-redis:6379/0.
+  # Maps to --redis-url.
+  url: ""
+
+# ---------------------------------------------------------------------------
+# cert-manager (optional certificate issuance)
+# ---------------------------------------------------------------------------
+# When enabled, the controller's mTLS material -- the agent-facing gRPC server
+# cert and the ControllerPeer cert -- is issued by cert-manager through the
+# cert-manager CSI driver (csi.cert-manager.io) instead of being mounted from
+# pre-created Secrets. The CSI driver mints a short-lived per-pod certificate at
+# pod start and renews it in place, which fits the peer plane whose SAN must carry
+# the pod's own headless DNS name (no wildcard needed). Requires both cert-manager
+# and cert-manager-csi-driver installed in the cluster.
+#
+# NOTE: the controller verifies agent client certs (grpc) and sibling certs (peer)
+# against the ca.crt the CSI driver writes -- the issuer's CA. So agents and all
+# controllers must be issued from the same trust chain as this issuer.
+certManager:
+  enabled: false
+
+  # issuerKind is Issuer or ClusterIssuer.
+  issuerKind: ClusterIssuer
+
+  # issuerName is the (Cluster)Issuer that signs the controller certificates.
+  # Required when enabled.
+  issuerName: ""
+
+  # issuerGroup is the issuer's API group (cert-manager.io for the built-in
+  # issuers; change only for an external issuer).
+  issuerGroup: cert-manager.io
+
+  # duration / renewBefore control the issued certificate lifetime and rotation.
+  duration: 2160h    # 90d
+  renewBefore: 360h  # 15d
 
 # ---------------------------------------------------------------------------
 # Default listener (in-cluster: metrics / probe / version / logging)
