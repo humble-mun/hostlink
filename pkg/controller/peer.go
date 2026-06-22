@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"sync"
@@ -57,6 +58,50 @@ func (s *peerServer) Dispatch(ctx context.Context, req *hostlinkv1.DispatchReque
 	return
 }
 
+// DispatchStream resolves the agent locally and runs a streaming request,
+// forwarding each AgentResult frame (progress frames followed by the terminal
+// frame) to the caller. A stale mapping is rejected with FAILED_PRECONDITION so
+// the caller re-resolves and retries.
+func (s *peerServer) DispatchStream(req *hostlinkv1.DispatchRequest, stream grpc.ServerStreamingServer[hostlinkv1.AgentResult]) (err error) {
+	agentID := req.GetAgentId()
+	conn, ok := s.registry.get(agentID)
+	if !ok {
+		return status.Errorf(codes.FailedPrecondition, "agent %q not held by this controller", agentID)
+	}
+	ctx := stream.Context()
+	frames, cancel, derr := conn.dispatchStream(ctx, req.GetRequest().GetMethod(), req.GetRequest().GetPayload())
+	if derr != nil {
+		s.logger.Error(derr, "relayed stream dispatch to agent failed", "agentID", agentID)
+		if errors.Is(derr, errAgentDisconnected) {
+			return status.Errorf(codes.FailedPrecondition, "agent %q disconnected during dispatch", agentID)
+		}
+		return status.Errorf(codes.Internal, "dispatch to agent %q failed", agentID)
+	}
+	defer cancel()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case frame, ok := <-frames:
+			if !ok {
+				return status.Errorf(codes.FailedPrecondition, "agent %q disconnected during dispatch", agentID)
+			}
+			if err = stream.Send(&hostlinkv1.AgentResult{
+				RequestId: req.GetRequest().GetRequestId(),
+				Payload:   frame.Payload,
+				Code:      frame.Code,
+				Error:     frame.Error,
+				Final:     frame.Final,
+			}); err != nil {
+				return fmt.Errorf("forward agent %q result frame: %w", agentID, err)
+			}
+			if frame.Final {
+				return nil
+			}
+		}
+	}
+}
+
 // peerClients dials sibling controllers' ControllerPeer listeners and caches one
 // connection per peer address. grpc.ClientConn is safe for concurrent use, so a
 // single connection per sibling is reused across relays.
@@ -91,6 +136,58 @@ func (p *peerClients) dispatch(ctx context.Context, addr, agentID, method string
 		}
 		return
 	}
+	return
+}
+
+// dispatchStream relays a streaming request to the controller at addr, returning
+// a channel of frames (progress frames followed by the terminal frame) closed
+// when the relay ends. A FAILED_PRECONDITION from the sibling (its mapping was
+// stale) is normalized to errAgentNotConnected so the REST layer reports a 404.
+// The caller must cancel ctx to release the relay goroutine.
+func (p *peerClients) dispatchStream(ctx context.Context, addr, agentID, method string, payload []byte) (frames <-chan streamFrame, err error) {
+	var conn *grpc.ClientConn
+	if conn, err = p.conn(addr); err != nil {
+		return
+	}
+	client := hostlinkv1.NewControllerPeerClient(conn)
+	var relay grpc.ServerStreamingClient[hostlinkv1.AgentResult]
+	if relay, err = client.DispatchStream(ctx, &hostlinkv1.DispatchRequest{
+		AgentId: agentID,
+		Request: &hostlinkv1.AgentRequest{Method: method, Payload: payload},
+	}); err != nil {
+		if status.Code(err) == codes.FailedPrecondition {
+			err = errAgentNotConnected
+		}
+		return
+	}
+	ch := make(chan streamFrame, 64)
+	frames = ch
+	go func() {
+		defer close(ch)
+		for {
+			result, rerr := relay.Recv()
+			if rerr != nil {
+				if !errors.Is(rerr, io.EOF) {
+					p.logger.Error(rerr, "peer stream relay recv failed", "agentID", agentID, "addr", addr)
+				}
+				return
+			}
+			frame := streamFrame{
+				Payload: result.GetPayload(),
+				Code:    result.GetCode(),
+				Error:   result.GetError(),
+				Final:   result.GetFinal(),
+			}
+			select {
+			case ch <- frame:
+			case <-ctx.Done():
+				return
+			}
+			if frame.Final {
+				return
+			}
+		}
+	}()
 	return
 }
 

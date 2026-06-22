@@ -34,6 +34,12 @@ service ControllerPeer {
   // agent (the mapping went stale) rejects with FAILED_PRECONDITION so the
   // caller re-resolves and retries.
   rpc Dispatch(DispatchRequest) returns (AgentResult);
+
+  // DispatchStream relays a streaming agent-targeted request to the holding pod.
+  // Each streamed AgentResult is a progress frame except the last, which has
+  // final=true and carries the terminal code/payload/error. Used for long-running
+  // operations (e.g. "images.pull") that report progress before completing.
+  rpc DispatchStream(DispatchRequest) returns (stream AgentResult);
 }
 
 // AgentEvent is the agent->controller direction of the Control stream.
@@ -44,6 +50,7 @@ message AgentEvent {
     Heartbeat heartbeat = 3;  // refresh the TTL of the agent->pod mapping in Redis
     DockerEvent event = 4;    // container start/stop/die reports
     AgentResult result = 5;   // reply to a controller->agent AgentRequest
+    AgentProgress progress = 6; // streaming progress for a long-running AgentRequest
   }
 }
 
@@ -93,6 +100,15 @@ message AgentResult {
   uint32 code = 2;
   bytes  payload = 3; // method-specific result body, JSON-encoded
   string error = 4;
+  bool   final = 5; // on a streamed reply, marks the terminal frame
+}
+
+// AgentProgress is an intermediate, non-terminal update for a long-running
+// AgentRequest, correlated by request_id. payload carries a method-specific
+// progress body (JSON); the operation still completes with an AgentResult.
+message AgentProgress {
+  string request_id = 1;
+  bytes  payload = 2; // method-specific progress body, JSON-encoded
 }
 
 // DispatchRequest wraps an AgentRequest with the agent_id routing key for the

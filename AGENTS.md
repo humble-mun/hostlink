@@ -95,9 +95,9 @@ Each agent maintains **one** gRPC connection to the controller. Every logical ch
 
 On connect, the agent opens `Control(stream AgentEvent) returns (stream Command)`. The controller pushes down the `Command` stream: `OpenForward`, `DockerOp` (run/stop/start/pause/unpause/rm), `ExposeRule`. The agent reports handshake, heartbeats, and Docker events up the `AgentEvent` stream.
 
-**Generic request/response dispatch (implemented).** On top of the command channel there is a generic, method-dispatched request envelope used to serve synchronous API calls: the controller pushes `Command.AgentRequest{request_id, method, payload}` and the agent replies with `AgentEvent.AgentResult{request_id, code, payload, error}`, correlated by `request_id`. `method`/`payload` are opaque JSON; `code` mirrors an HTTP status so the REST layer maps it back directly. The controller-side dispatcher keeps a per-`request_id` channel and a single Recv loop fans results back to the waiting handler; sends are serialized (a gRPC stream allows one concurrent Send). The first method is `images.list` (`agentapi.MethodImagesList`); the agent handler lists local Docker images via the docker client and returns them as JSON.
+**Generic request/response dispatch (implemented).** On top of the command channel there is a generic, method-dispatched request envelope used to serve API calls: the controller pushes `Command.AgentRequest{request_id, method, payload}` and the agent replies with `AgentEvent.AgentResult{request_id, code, payload, error, final}`, correlated by `request_id`. `method`/`payload` are opaque JSON; `code` mirrors an HTTP status so the REST layer maps it back directly. The controller-side dispatcher keeps a per-`request_id` channel and a single Recv loop fans results back to the waiting handler; sends are serialized (a gRPC stream allows one concurrent Send). Long-running methods stream: the agent emits `AgentEvent.AgentProgress{request_id, payload}` frames and a terminal `AgentResult{final: true}`; the dispatcher keeps the channel open until `final`. Implemented methods: `images.list` (`agentapi.MethodImagesList`, single-shot), `images.pull` (`agentapi.MethodImagesPull`, streaming progress), and `images.remove` (`agentapi.MethodImagesRemove`, single-shot batch).
 
-**REST surface (implemented).** The controller exposes `GET /api/v1/agents/<agentId>/images` (Gin, on the in-cluster default listener), which dispatches `images.list` to the agent and returns its JSON payload unchanged. Resolution is local-or-relay: if the agent's `Control` stream is on this replica, dispatch directly; otherwise resolve the holding pod from Redis and relay via `ControllerPeer.Dispatch` (§4.5). With the peer plane or Redis disabled, a miss returns 404.
+**REST surface (implemented).** The controller exposes (Gin, on the in-cluster default listener): `GET /api/v1/agents` (list connected agents); `GET /api/v1/agents/<agentId>/images` (dispatch `images.list`, return JSON unchanged); `POST /api/v1/agents/<agentId>/images` (dispatch the streaming `images.pull`, body `{image, auth?}`, response is **`text/event-stream`** SSE — each `data:` line a `PullProgress` JSON, terminated by `data: {done:true,...}`); `DELETE /api/v1/agents/<agentId>/images/<imageId>` and `DELETE /api/v1/agents/<agentId>/images?ref=A&ref=B` (dispatch `images.remove`, single by path param or batch by repeated `ref`, optional `?force`/`?noPrune`). Resolution is local-or-relay: if the agent's `Control` stream is on this replica, dispatch directly; otherwise resolve the holding pod from Redis and relay via `ControllerPeer.Dispatch` (unary) or `ControllerPeer.DispatchStream` (the SSE pull) (§4.5). With the peer plane or Redis disabled, a miss returns 404.
 
 ### 4.3 Metrics: single aggregated /metrics with reverse fan-out
 
@@ -137,7 +137,7 @@ This handshake + chunking + session pairing is **provided by `openconfig/grpctun
 
 The controller runs multiple replicas (required for HA). **The affinity problem:** an agent's connection is pinned to the **one** pod it dialed; public TCP arriving through the L4 LB lands on **any** replica, and the receiving pod is usually not the one holding that agent.
 
-> **Implementation status.** The `agent:<id> → holding_pod` Redis map (write on connect, compare-and-delete on disconnect, TTL refreshed by heartbeat) and the cross-pod relay for **API requests** — `ControllerPeer.Dispatch` over a dedicated in-cluster mTLS listener, with reject-and-retry on a stale mapping — are **implemented** (see §6). What is **not** implemented yet: the `port:<P>` map and atomic port allocation, and the cross-pod relay of the **port-forward data plane** (the two byte-pipe hops). The description below is the full design for that data-plane path; today only the request-dispatch relay exists.
+> **Implementation status.** The `agent:<id> → holding_pod` Redis map (write on connect, compare-and-delete on disconnect, TTL refreshed by heartbeat) and the cross-pod relay for **API requests** — `ControllerPeer.Dispatch` (unary) and `ControllerPeer.DispatchStream` (streaming, e.g. the SSE image pull) over a dedicated in-cluster mTLS listener, with reject-and-retry on a stale mapping — are **implemented** (see §6). What is **not** implemented yet: the `port:<P>` map and atomic port allocation, and the cross-pod relay of the **port-forward data plane** (the two byte-pipe hops). The description below is the full design for that data-plane path; today only the request-dispatch relay exists.
 
 - **Routing key:** for raw TCP the only key available at ingress is the **destination port** (there is no Host header). Each exposure = one distinct public port.
 - **Registry (Redis dual maps):**
@@ -191,6 +191,11 @@ service ControllerPeer {
   // A pod that no longer holds the agent rejects with FAILED_PRECONDITION so the
   // caller re-resolves and retries.
   rpc Dispatch(DispatchRequest) returns (AgentResult);
+
+  // Streaming variant for long-running ops (e.g. images.pull): each streamed
+  // AgentResult is a progress frame except the last (final = true), which carries
+  // the terminal code/payload/error.
+  rpc DispatchStream(DispatchRequest) returns (stream AgentResult);
 }
 
 message AgentEvent {
@@ -199,7 +204,8 @@ message AgentEvent {
     Hello hello = 2;          // initial handshake: auth, capability declaration
     Heartbeat heartbeat = 3;  // refresh the TTL of the agent->pod mapping in Redis
     DockerEvent event = 4;    // container start/stop/die reports
-    AgentResult result = 5;   // reply to a controller->agent AgentRequest
+    AgentResult result = 5;   // reply to a controller->agent AgentRequest (final = true)
+    AgentProgress progress = 6; // non-terminal progress for a long-running AgentRequest
   }
 }
 message Hello { string token = 1; }
@@ -222,7 +228,8 @@ message ExposeRule  { string container_target = 1; uint32 public_port = 2; bool 
 // the operation (e.g. "images.list"); payload is its JSON body; code mirrors an HTTP
 // status. DispatchRequest wraps it with the agent_id routing key for the peer hop.
 message AgentRequest    { string request_id = 1; string method = 2; bytes payload = 3; }
-message AgentResult     { string request_id = 1; uint32 code = 2; bytes payload = 3; string error = 4; }
+message AgentResult     { string request_id = 1; uint32 code = 2; bytes payload = 3; string error = 4; bool final = 5; } // final marks the terminal frame of a (possibly streamed) reply
+message AgentProgress   { string request_id = 1; bytes payload = 2; } // method-specific progress JSON (e.g. images.pull layer status)
 message DispatchRequest { string agent_id = 1; AgentRequest request = 2; }
 
 message Frame {
@@ -277,10 +284,10 @@ relay(localTCP, frameStream):
 In dependency order (`[done]` / `[partial]` / `[todo]` reflect current status):
 
 1. `[done]` `AgentLink` proto + generated code; agent↔controller connection setup, `Hello`/`Heartbeat`. (Reconnection: the agent's lifecycle is resilient but full reconnect-with-backoff is still thin.)
-2. `[partial]` Command dispatch and execution. The **generic `AgentRequest`/`AgentResult` envelope** and the first method **`images.list`** (with its REST endpoint and the controller dispatcher) are done. `DockerOp` (run/stop/start/rm) execution and `DockerEvent` reporting are `[todo]`.
+2. `[partial]` Command dispatch and execution. The **generic `AgentRequest`/`AgentResult` envelope** (with the streaming `AgentProgress`/`final` extension) and the Docker **images** methods — **`images.list`**, **`images.pull`** (streaming SSE progress), **`images.remove`** — with their REST endpoints and the controller dispatcher are done. `DockerOp` (run/stop/start/rm) execution and `DockerEvent` reporting are `[todo]`.
 3. `[todo]` Metrics: node_exporter sidecar + agent local pull; controller `/metrics` concurrent fan-out + MetricFamily merge + `agent_up`.
 4. `[todo]` Port forwarding: integrate `openconfig/grpctunnel` (**verify half-close first**); `ExposeRule`/`OpenForward`; Frame relay (with half-close and backpressure). `Forward` is currently a stub.
-5. `[partial]` Multi-replica affinity. Done: the `agent:<id> → holding_pod` Redis map (write/CAD-delete/TTL-refresh) and the **cross-pod relay for API requests** (`ControllerPeer.Dispatch` on a dedicated in-cluster mTLS listener, optional via `peer.enabled`, with reject-and-retry on a stale mapping). `[todo]`: the `port:<P>` map + atomic port-pool allocation, and the cross-pod **port-forward** two-hop relay.
+5. `[partial]` Multi-replica affinity. Done: the `agent:<id> → holding_pod` Redis map (write/CAD-delete/TTL-refresh; standalone/sentinel/cluster topologies) and the **cross-pod relay for API requests** (`ControllerPeer.Dispatch` unary + `ControllerPeer.DispatchStream` streaming, on a dedicated in-cluster mTLS listener, optional via `peer.enabled`, with reject-and-retry on a stale mapping). `[todo]`: the `port:<P>` map + atomic port-pool allocation, and the cross-pod **port-forward** two-hop relay.
 6. `[todo]` Lifecycle coupling: Docker events drive exposure establish/suspend/re-establish.
 
 ---

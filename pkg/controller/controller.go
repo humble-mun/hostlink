@@ -113,7 +113,11 @@ func (svc *service) RegisterScrapeHook(context.Context) {}
 
 func (svc *service) RegisterRoute(mux *gin.Engine) {
 	group := mux.Group("/api/v1")
+	group.GET("/agents", svc.listAgents)
 	group.GET("/agents/:agentId/images", svc.listAgentImages)
+	group.POST("/agents/:agentId/images", svc.pullAgentImage)
+	group.DELETE("/agents/:agentId/images", svc.removeAgentImages)
+	group.DELETE("/agents/:agentId/images/:imageId", svc.removeAgentImages)
 }
 
 func (svc *service) Close() (err error) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +20,7 @@ import (
 	"google.golang.org/grpc/credentials"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
+	"github.com/humble-mun/hostlink/pkg/agentapi"
 	hostlinkv1 "github.com/humble-mun/hostlink/pkg/api/hostlink/v1"
 )
 
@@ -217,13 +219,56 @@ func (a *agent) receiveCommands(ctx context.Context, logger logr.Logger) (err er
 }
 
 // handleAndReply executes a request and sends its result back over the Control
-// stream. A send failure is logged: the controller-side dispatcher unblocks via
-// its own timeout, so there is nothing to return here.
+// stream. Single-shot methods produce one AgentResult; the streaming images.pull
+// method emits zero or more AgentProgress events before its terminal AgentResult.
+// A send failure is logged: the controller-side dispatcher unblocks via its own
+// timeout, so there is nothing to return here.
 func (a *agent) handleAndReply(ctx context.Context, req *hostlinkv1.AgentRequest, logger logr.Logger) {
+	if req.GetMethod() == agentapi.MethodImagesPull {
+		a.handlePull(ctx, req, logger)
+		return
+	}
 	event := a.handleRequest(ctx, req)
 	if err := a.send(event); err != nil {
 		logger.Error(err, "send agent result failed",
 			"requestID", req.GetRequestId(), "method", req.GetMethod())
+	}
+}
+
+// handlePull runs a streaming images.pull: each PullProgress is sent as an
+// AgentProgress event correlated by request_id, then a terminal AgentResult
+// (Final=true) reports the outcome. emit send failures abort the pull by
+// cancelling ctx, so a disconnected upstream stops the underlying docker pull.
+func (a *agent) handlePull(ctx context.Context, req *hostlinkv1.AgentRequest, logger logr.Logger) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	requestID := req.GetRequestId()
+	emit := func(p *agentapi.PullProgress) {
+		payload, err := json.Marshal(p)
+		if err != nil {
+			logger.Error(err, "marshal pull progress failed", "requestID", requestID)
+			return
+		}
+		if err := a.send(&hostlinkv1.AgentEvent{
+			AgentId: a.nodeName,
+			Kind: &hostlinkv1.AgentEvent_Progress{Progress: &hostlinkv1.AgentProgress{
+				RequestId: requestID,
+				Payload:   payload,
+			}},
+		}); err != nil {
+			logger.Error(err, "send pull progress failed", "requestID", requestID)
+			cancel()
+		}
+	}
+
+	code, errMsg := a.pullImage(ctx, req, emit)
+	result := &hostlinkv1.AgentResult{RequestId: requestID, Code: code, Error: errMsg, Final: true}
+	if err := a.send(&hostlinkv1.AgentEvent{
+		AgentId: a.nodeName,
+		Kind:    &hostlinkv1.AgentEvent_Result{Result: result},
+	}); err != nil {
+		logger.Error(err, "send pull result failed", "requestID", requestID, "method", req.GetMethod())
 	}
 }
 

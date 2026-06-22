@@ -134,6 +134,46 @@ func (r *registry) locate(ctx context.Context, agentID string) (addr string, err
 	return
 }
 
+// listAll returns the set of agentIDs currently online across all replicas, by
+// scanning the agent->pod directory in redis. In in-memory mode (no redis) it
+// falls back to the locally-held agents, which is the entire fleet for a
+// single-replica controller. The returned list is deduplicated but unordered.
+func (r *registry) listAll(ctx context.Context) (agentIDs []string, err error) {
+	if r.redis == nil {
+		r.mu.RLock()
+		agentIDs = make([]string, 0, len(r.agents))
+		for id := range r.agents {
+			agentIDs = append(agentIDs, id)
+		}
+		r.mu.RUnlock()
+		return
+	}
+
+	seen := make(map[string]struct{})
+	var cursor uint64
+	for {
+		var keys []string
+		if keys, cursor, err = r.redis.Scan(ctx, cursor, mappingKeyPrefix+"*", 256).Result(); err != nil {
+			err = fmt.Errorf("scan agent mappings in redis: %w", err)
+			return
+		}
+		for _, key := range keys {
+			if len(key) <= len(mappingKeyPrefix) {
+				continue
+			}
+			seen[key[len(mappingKeyPrefix):]] = struct{}{}
+		}
+		if cursor == 0 {
+			break
+		}
+	}
+	agentIDs = make([]string, 0, len(seen))
+	for id := range seen {
+		agentIDs = append(agentIDs, id)
+	}
+	return
+}
+
 // writeMapping publishes agentID->selfAddr with a TTL. It is best effort: redis
 // is an optimization for cross-pod routing, so a failure is logged but never
 // blocks local registration or dispatch.
@@ -170,18 +210,30 @@ type agentConn struct {
 
 	sendMu sync.Mutex
 
-	mu      sync.Mutex
-	pending map[string]chan *hostlinkv1.AgentResult
-	closed  bool
-	seq     atomic.Uint64
+	mu            sync.Mutex
+	pending       map[string]chan *hostlinkv1.AgentResult
+	pendingStream map[string]chan streamFrame
+	closed        bool
+	seq           atomic.Uint64
+}
+
+// streamFrame is one delivery on a streaming dispatch's channel: either a
+// progress frame (Final false, Payload carries the method-specific progress
+// JSON) or the terminal frame (Final true, Code/Error report the outcome).
+type streamFrame struct {
+	Payload []byte
+	Code    uint32
+	Error   string
+	Final   bool
 }
 
 func newAgentConn(agentID string, stream grpc.BidiStreamingServer[hostlinkv1.AgentEvent, hostlinkv1.Command], logger logr.Logger) *agentConn {
 	return &agentConn{
-		agentID: agentID,
-		logger:  logger,
-		stream:  stream,
-		pending: make(map[string]chan *hostlinkv1.AgentResult),
+		agentID:       agentID,
+		logger:        logger,
+		stream:        stream,
+		pending:       make(map[string]chan *hostlinkv1.AgentResult),
+		pendingStream: make(map[string]chan streamFrame),
 	}
 }
 
@@ -231,6 +283,49 @@ func (c *agentConn) dispatch(ctx context.Context, method string, payload []byte)
 	return
 }
 
+// dispatchStream drives a streaming method to the agent and returns a channel of
+// frames: zero or more progress frames followed by exactly one terminal frame
+// (Final true), after which the channel is closed. The channel is buffered and
+// progress sends are non-blocking dropped, so a slow consumer can never stall the
+// shared Control stream. The caller must drain until the channel is closed; the
+// returned cancel removes the pending registration and must be called when the
+// caller stops reading (e.g. its context ends).
+func (c *agentConn) dispatchStream(_ context.Context, method string, payload []byte) (frames <-chan streamFrame, cancel func(), err error) {
+	requestID := strconv.FormatUint(c.seq.Add(1), 10)
+	ch := make(chan streamFrame, 64)
+
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		err = errAgentDisconnected
+		return
+	}
+	c.pendingStream[requestID] = ch
+	c.mu.Unlock()
+
+	cancel = func() {
+		c.mu.Lock()
+		delete(c.pendingStream, requestID)
+		c.mu.Unlock()
+	}
+
+	if err = c.send(&hostlinkv1.Command{
+		Cmd: &hostlinkv1.Command_Request{
+			Request: &hostlinkv1.AgentRequest{
+				RequestId: requestID,
+				Method:    method,
+				Payload:   payload,
+			},
+		},
+	}); err != nil {
+		cancel()
+		cancel = nil
+		return
+	}
+	frames = ch
+	return
+}
+
 // send writes a command to the agent under sendMu so concurrent dispatchers do
 // not interleave writes on the stream.
 func (c *agentConn) send(cmd *hostlinkv1.Command) (err error) {
@@ -242,12 +337,20 @@ func (c *agentConn) send(cmd *hostlinkv1.Command) (err error) {
 	return
 }
 
-// deliver routes an AgentResult to its waiting dispatcher. Each request has its
-// own buffered (cap 1) channel, so the send never blocks while holding mu.
+// deliver routes a terminal AgentResult to its waiting dispatcher. It first
+// looks for a streaming request (delivering a terminal frame and closing the
+// stream), then a unary one. Each unary request has its own buffered (cap 1)
+// channel, so the send never blocks while holding mu.
 func (c *agentConn) deliver(result *hostlinkv1.AgentResult) {
 	requestID := result.GetRequestId()
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if sch, ok := c.pendingStream[requestID]; ok {
+		sch <- streamFrame{Payload: result.GetPayload(), Code: result.GetCode(), Error: result.GetError(), Final: true}
+		close(sch)
+		delete(c.pendingStream, requestID)
+		return
+	}
 	ch, ok := c.pending[requestID]
 	if !ok {
 		c.logger.Info("dropping agent result with no pending request", "requestID", requestID)
@@ -255,6 +358,25 @@ func (c *agentConn) deliver(result *hostlinkv1.AgentResult) {
 	}
 	ch <- result
 	delete(c.pending, requestID)
+}
+
+// deliverProgress routes an AgentProgress frame to its streaming dispatcher.
+// Delivery is non-blocking: if the consumer's buffer is full the frame is
+// dropped (progress is advisory and must never stall the shared Control stream).
+func (c *agentConn) deliverProgress(progress *hostlinkv1.AgentProgress) {
+	requestID := progress.GetRequestId()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	sch, ok := c.pendingStream[requestID]
+	if !ok {
+		c.logger.Info("dropping agent progress with no pending stream", "requestID", requestID)
+		return
+	}
+	select {
+	case sch <- streamFrame{Payload: progress.GetPayload()}:
+	default:
+		c.logger.Info("dropping agent progress: consumer buffer full", "requestID", requestID)
+	}
 }
 
 // closeAll marks the connection closed and unblocks every outstanding
@@ -266,5 +388,9 @@ func (c *agentConn) closeAll() {
 	for requestID, ch := range c.pending {
 		close(ch)
 		delete(c.pending, requestID)
+	}
+	for requestID, sch := range c.pendingStream {
+		close(sch)
+		delete(c.pendingStream, requestID)
 	}
 }

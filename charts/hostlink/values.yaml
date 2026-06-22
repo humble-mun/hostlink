@@ -87,8 +87,13 @@ peer:
 # held by another replica returns 404. Cross-pod relay needs BOTH redis.url and
 # peer.enabled set.
 redis:
-  # url is the connection URL, e.g. redis://:password@hostlink-redis:6379/0.
-  # Maps to --redis-url.
+  # url is the connection URL. Maps to --redis-url. The deployment topology is
+  # selected by the URL scheme, so no extra setting is needed:
+  #   standalone: redis://:password@hostlink-redis:6379/0   (also rediss:// for TLS)
+  #   sentinel:   redis+sentinel://sentinel:26379?master_name=mymaster&addr=sentinel2:26379
+  #   cluster:    redis+cluster://node1:6379?addr=node2:6379&addr=node3:6379
+  # Extra sentinel/cluster nodes are listed via the repeatable ?addr= query
+  # parameter. Username/password and ?db go in the URL as usual.
   url: ""
 
 # ---------------------------------------------------------------------------

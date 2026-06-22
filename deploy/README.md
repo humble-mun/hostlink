@@ -30,10 +30,11 @@ reachability to the controller.
 | `root` / `sudo` | To install the binary, create the service user, and write under `/etc/humble-mun/` |
 
 Docker is used **lazily**: the agent opens a Docker client (`client.FromEnv`) but
-does not dial the daemon until a request needs it. The only implemented request,
-`images.list` (behind the controller's `GET /api/v1/agents/<id>/images`), reads
-the local image list — so for that endpoint to work the daemon must be reachable
-and the service user must be able to access the Docker socket (add `hostlink` to
+does not dial the daemon until a request needs it. The implemented requests are
+the Docker **images** methods — `images.list`, `images.pull`, `images.remove`
+(behind the controller's `GET`/`POST`/`DELETE /api/v1/agents/<id>/images`) — which
+talk to the local Docker daemon, so for those endpoints to work the daemon must
+be reachable and the service user must be able to access the Docker socket (add `hostlink` to
 the `docker` group — see [Step 4](#step-4--create-the-service-user)). The agent
 itself still starts and runs the `Control` stream (`Hello` + `Heartbeat`) without
 Docker, so the unit keeps `docker.service` as a soft (`Wants`) dependency.

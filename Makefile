@@ -8,7 +8,7 @@ VERSION ?= v1.0
 TIMESTAMP := $(shell date '+%Y%m%d%H%M')
 TAG ?= $(VERSION)$(shell test "$(ARCH)" != amd64 && echo "-$(ARCH)" || true)$(shell test ! -z $(VARIANT) && echo "-$(VARIANT)" || true)-$(TIMESTAMP)
 DEBUG ?= false
-REPO ?= harbor-0afe11c0.nip.io/humble-mun/hostlink-controller
+REPO ?= harbor-c0a811fc.nip.io/humble-mun/hostlink-controller
 DOCKERFILE ?= Dockerfile
 GO_VERSION ?= 1.26.4-trixie
 BASE_PROJECT ?= github.com/humble-mun/chassis

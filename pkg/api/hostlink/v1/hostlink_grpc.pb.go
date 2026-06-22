@@ -171,7 +171,8 @@ var AgentLink_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	ControllerPeer_Dispatch_FullMethodName = "/hostlink.v1.ControllerPeer/Dispatch"
+	ControllerPeer_Dispatch_FullMethodName       = "/hostlink.v1.ControllerPeer/Dispatch"
+	ControllerPeer_DispatchStream_FullMethodName = "/hostlink.v1.ControllerPeer/DispatchStream"
 )
 
 // ControllerPeerClient is the client API for ControllerPeer service.
@@ -191,6 +192,11 @@ type ControllerPeerClient interface {
 	// agent (the mapping went stale) rejects with FAILED_PRECONDITION so the
 	// caller re-resolves and retries.
 	Dispatch(ctx context.Context, in *DispatchRequest, opts ...grpc.CallOption) (*AgentResult, error)
+	// DispatchStream relays a streaming agent-targeted request to the holding pod.
+	// Each streamed AgentResult is a progress frame except the last, which has
+	// final=true and carries the terminal code/payload/error. Used for long-running
+	// operations (e.g. "images.pull") that report progress before completing.
+	DispatchStream(ctx context.Context, in *DispatchRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[AgentResult], error)
 }
 
 type controllerPeerClient struct {
@@ -211,6 +217,25 @@ func (c *controllerPeerClient) Dispatch(ctx context.Context, in *DispatchRequest
 	return out, nil
 }
 
+func (c *controllerPeerClient) DispatchStream(ctx context.Context, in *DispatchRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[AgentResult], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &ControllerPeer_ServiceDesc.Streams[0], ControllerPeer_DispatchStream_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[DispatchRequest, AgentResult]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type ControllerPeer_DispatchStreamClient = grpc.ServerStreamingClient[AgentResult]
+
 // ControllerPeerServer is the server API for ControllerPeer service.
 // All implementations must embed UnimplementedControllerPeerServer
 // for forward compatibility.
@@ -228,6 +253,11 @@ type ControllerPeerServer interface {
 	// agent (the mapping went stale) rejects with FAILED_PRECONDITION so the
 	// caller re-resolves and retries.
 	Dispatch(context.Context, *DispatchRequest) (*AgentResult, error)
+	// DispatchStream relays a streaming agent-targeted request to the holding pod.
+	// Each streamed AgentResult is a progress frame except the last, which has
+	// final=true and carries the terminal code/payload/error. Used for long-running
+	// operations (e.g. "images.pull") that report progress before completing.
+	DispatchStream(*DispatchRequest, grpc.ServerStreamingServer[AgentResult]) error
 	mustEmbedUnimplementedControllerPeerServer()
 }
 
@@ -240,6 +270,9 @@ type UnimplementedControllerPeerServer struct{}
 
 func (UnimplementedControllerPeerServer) Dispatch(context.Context, *DispatchRequest) (*AgentResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method Dispatch not implemented")
+}
+func (UnimplementedControllerPeerServer) DispatchStream(*DispatchRequest, grpc.ServerStreamingServer[AgentResult]) error {
+	return status.Error(codes.Unimplemented, "method DispatchStream not implemented")
 }
 func (UnimplementedControllerPeerServer) mustEmbedUnimplementedControllerPeerServer() {}
 func (UnimplementedControllerPeerServer) testEmbeddedByValue()                        {}
@@ -280,6 +313,17 @@ func _ControllerPeer_Dispatch_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ControllerPeer_DispatchStream_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(DispatchRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(ControllerPeerServer).DispatchStream(m, &grpc.GenericServerStream[DispatchRequest, AgentResult]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type ControllerPeer_DispatchStreamServer = grpc.ServerStreamingServer[AgentResult]
+
 // ControllerPeer_ServiceDesc is the grpc.ServiceDesc for ControllerPeer service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -292,6 +336,12 @@ var ControllerPeer_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _ControllerPeer_Dispatch_Handler,
 		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "DispatchStream",
+			Handler:       _ControllerPeer_DispatchStream_Handler,
+			ServerStreams: true,
+		},
+	},
 	Metadata: "hostlink/v1/hostlink.proto",
 }

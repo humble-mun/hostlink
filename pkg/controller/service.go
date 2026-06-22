@@ -55,38 +55,52 @@ func (s *impl) Control(srv grpc.BidiStreamingServer[hostlinkv1.AgentEvent, hostl
 			return
 		}
 
-		eventLogger := logger.WithValues("agentID", event.GetAgentId())
-		switch kind := event.GetKind().(type) {
-		case *hostlinkv1.AgentEvent_Hello:
-			eventLogger.Info("agent hello received", "token", kind.Hello.GetToken())
-			if conn == nil {
-				conn = newAgentConn(event.GetAgentId(), srv, s.logger.WithName("agentConn").WithValues("agentID", event.GetAgentId()))
-				if replaced := s.registry.add(conn); replaced != nil {
-					replaced.closeAll()
-					eventLogger.Info("replaced existing agent connection")
-				}
-				eventLogger.Info("agent registered")
-			}
-		case *hostlinkv1.AgentEvent_Heartbeat:
-			eventLogger.Info("agent heartbeat received")
-			if conn != nil {
-				s.registry.refresh(conn.agentID)
-			}
-		case *hostlinkv1.AgentEvent_Event:
-			eventLogger.Info("agent docker event received",
-				"type", kind.Event.GetType(),
-				"containerID", kind.Event.GetContainerId(),
-			)
-		case *hostlinkv1.AgentEvent_Result:
-			if conn == nil {
-				eventLogger.Info("dropping agent result before registration", "requestID", kind.Result.GetRequestId())
-				continue
-			}
-			conn.deliver(kind.Result)
-		default:
-			eventLogger.Info("agent event received with unknown kind")
-		}
+		conn = s.handleAgentEvent(conn, srv, event, logger)
 	}
+}
+
+// handleAgentEvent processes a single inbound AgentEvent and returns the
+// (possibly newly created) agent connection. Splitting this out of Control keeps
+// the receive loop's cyclomatic complexity in check.
+func (s *impl) handleAgentEvent(conn *agentConn, srv grpc.BidiStreamingServer[hostlinkv1.AgentEvent, hostlinkv1.Command], event *hostlinkv1.AgentEvent, logger logr.Logger) *agentConn {
+	eventLogger := logger.WithValues("agentID", event.GetAgentId())
+	switch kind := event.GetKind().(type) {
+	case *hostlinkv1.AgentEvent_Hello:
+		eventLogger.Info("agent hello received", "token", kind.Hello.GetToken())
+		if conn == nil {
+			conn = newAgentConn(event.GetAgentId(), srv, s.logger.WithName("agentConn").WithValues("agentID", event.GetAgentId()))
+			if replaced := s.registry.add(conn); replaced != nil {
+				replaced.closeAll()
+				eventLogger.Info("replaced existing agent connection")
+			}
+			eventLogger.Info("agent registered")
+		}
+	case *hostlinkv1.AgentEvent_Heartbeat:
+		eventLogger.Info("agent heartbeat received")
+		if conn != nil {
+			s.registry.refresh(conn.agentID)
+		}
+	case *hostlinkv1.AgentEvent_Event:
+		eventLogger.Info("agent docker event received",
+			"type", kind.Event.GetType(),
+			"containerID", kind.Event.GetContainerId(),
+		)
+	case *hostlinkv1.AgentEvent_Result:
+		if conn == nil {
+			eventLogger.Info("dropping agent result before registration", "requestID", kind.Result.GetRequestId())
+			return conn
+		}
+		conn.deliver(kind.Result)
+	case *hostlinkv1.AgentEvent_Progress:
+		if conn == nil {
+			eventLogger.Info("dropping agent progress before registration", "requestID", kind.Progress.GetRequestId())
+			return conn
+		}
+		conn.deliverProgress(kind.Progress)
+	default:
+		eventLogger.Info("agent event received with unknown kind")
+	}
+	return conn
 }
 
 // Forward is the helloworld-level placeholder for the port-forward byte pipe. The

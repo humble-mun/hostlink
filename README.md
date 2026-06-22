@@ -5,7 +5,9 @@
 > ⚠️ **EARLY STAGE — NOT PRODUCTION READY.** Implemented and verified end-to-end:
 > the agent↔controller mTLS connection and `Control` stream (handshake +
 > heartbeat); a generic request/response dispatch envelope with the first REST
-> endpoint (`GET /api/v1/agents/<id>/images`) served by an agent-side Docker
+> endpoint family for **Docker images** (`GET`/`POST`/`DELETE
+> /api/v1/agents/<id>/images` — list, pull with streaming SSE progress, and
+> remove) served by an agent-side Docker
 > client; the Redis-backed `agent→pod` registry; and cross-pod API relay via the
 > `ControllerPeer` plane (multi-replica HA). Still **designed but not yet
 > implemented**: container *lifecycle* ops (`DockerOp`/events), metrics fan-out,
@@ -82,7 +84,7 @@ external host (behind NAT)                cloud (Kubernetes)
 
 One TCP connection, many HTTP/2 streams. The agent opens the `Control` stream once after connecting; the controller pushes commands down its response direction. Each forwarded public connection gets its own `Forward` stream so gRPC's per-stream flow control gives natural backpressure.
 
-> **What is implemented today:** the mTLS dial, the `Control` stream and `Hello` / `Heartbeat` exchange; the generic `AgentRequest`/`AgentResult` dispatch envelope with `GET /api/v1/agents/<id>/images` (the agent lists local Docker images); the Redis `agent→pod` registry; and cross-pod relay of API requests via `ControllerPeer.Dispatch`. `Forward`, `DockerOp` execution, metrics fan-out, and the cross-pod port-forward data plane are stubs or unimplemented. See [Roadmap](#roadmap).
+> **What is implemented today:** the mTLS dial, the `Control` stream and `Hello` / `Heartbeat` exchange; the generic `AgentRequest`/`AgentResult` dispatch envelope with the Docker **images** endpoints — `GET` (list), `POST` (pull, streaming SSE progress), and `DELETE` (remove) on `/api/v1/agents/<id>/images`; the Redis `agent→pod` registry; and cross-pod relay of API requests via `ControllerPeer.Dispatch` (unary) and `ControllerPeer.DispatchStream` (streaming, for the pull progress). `Forward`, `DockerOp` execution, metrics fan-out, and the cross-pod port-forward data plane are stubs or unimplemented. See [Roadmap](#roadmap).
 
 ---
 
@@ -181,15 +183,21 @@ service ControllerPeer {
   // request to the holding pod (resolved via the Redis agent->pod map). A stale
   // holder rejects with FAILED_PRECONDITION so the caller re-resolves and retries.
   rpc Dispatch(DispatchRequest) returns (AgentResult);
+
+  // Streaming variant for long-running ops (e.g. image pull): each streamed
+  // AgentResult is a progress frame except the last, which has final=true and
+  // carries the terminal code/payload/error.
+  rpc DispatchStream(DispatchRequest) returns (stream AgentResult);
 }
 ```
 
 | Message | Direction | Purpose |
 |---------|-----------|---------|
-| `AgentEvent{Hello / Heartbeat / DockerEvent / AgentResult}` | agent → controller | Handshake, TTL refresh, container reports, reply to an `AgentRequest` |
+| `AgentEvent{Hello / Heartbeat / DockerEvent / AgentResult / AgentProgress}` | agent → controller | Handshake, TTL refresh, container reports, reply to an `AgentRequest`, or a progress frame for a long-running one |
 | `Command{OpenForward / DockerOp / ExposeRule / AgentRequest}` | controller → agent | Open a forward stream, run a Docker op, add/remove an exposure rule, or a generic method-dispatched request |
-| `AgentRequest{request_id, method, payload}` / `AgentResult{request_id, code, payload, error}` | both | Generic API call: `method` names the op (e.g. `images.list`), `payload` is JSON, `code` mirrors an HTTP status, correlated by `request_id` |
-| `DispatchRequest{agent_id, AgentRequest}` | controller → controller | Wraps an `AgentRequest` with the routing key for the `ControllerPeer` hop |
+| `AgentRequest{request_id, method, payload}` / `AgentResult{request_id, code, payload, error, final}` | both | Generic API call: `method` names the op (e.g. `images.list`), `payload` is JSON, `code` mirrors an HTTP status, correlated by `request_id`; `final` marks the terminal frame of a streamed reply |
+| `AgentProgress{request_id, payload}` | agent → controller | A non-terminal progress update for a long-running `AgentRequest` (e.g. `images.pull`); `payload` is method-specific JSON. The op still completes with a `final` `AgentResult` |
+| `DispatchRequest{agent_id, AgentRequest}` | controller → controller | Wraps an `AgentRequest` with the routing key for the `ControllerPeer` hop (`Dispatch` unary, `DispatchStream` streaming) |
 | `Frame{session_id, type, data}` | both (per forward) | Raw TCP bytes; `type` ∈ `DATA` / `HALF_CLOSE` / `RESET` |
 
 The `Frame.Type` enum is what makes correct TCP half-close possible (see [Port Forwarding](#port-forwarding)). Regenerate and commit the generated code after any `.proto` change.
@@ -200,7 +208,11 @@ The controller serves a small REST surface on its in-cluster default listener, o
 
 | Method & path | Description |
 |---------------|-------------|
-| `GET /api/v1/agents/<agentId>/images` | List the Docker images on the given agent. Dispatches `images.list` to the agent's `Control` stream (locally, or relayed to the holding pod via `ControllerPeer`); returns the agent's JSON unchanged. 404 if the agent is connected to no reachable replica. |
+| `GET /api/v1/agents` | List the connected agents. |
+| `GET /api/v1/agents/<agentId>/images` | List the Docker images on the given agent. Dispatches `images.list` to the agent's `Control` stream (locally, or relayed to the holding pod via `ControllerPeer.Dispatch`); returns the agent's JSON unchanged. 404 if the agent is connected to no reachable replica. |
+| `POST /api/v1/agents/<agentId>/images` | Pull a Docker image on the agent. JSON body `{"image":"<ref>","auth":{...optional registry auth...}}`. Responds with a **`text/event-stream`** (SSE): each event is `data: <PullProgress JSON>` (`id`/`status`/`current`/`total`/`progress`), terminated by `data: {"done":true,"code":...,"error":...}`. Dispatches the streaming `images.pull` (locally, or relayed via `ControllerPeer.DispatchStream`); no dispatch timeout (large pulls take minutes). 404 if the agent is unreachable. |
+| `DELETE /api/v1/agents/<agentId>/images/<imageId>` | Remove a single image by ID (path param; works for an image ID or a digest, which contain no `/`). Optional `?force=true` and `?noPrune=true`. Dispatches `images.remove`; returns a `RemoveResult` JSON `{"deleted":[...],"errors":[...]}` (partial failures are reported, not fatal). |
+| `DELETE /api/v1/agents/<agentId>/images?ref=A&ref=B` | Remove multiple images by repeated `ref` query params (use this form for full `repo/path:tag` references, which contain `/` and cannot be a path segment). Same options/response as the single-image form. |
 
 ---
 
@@ -275,7 +287,7 @@ All flags can also be set via environment variables: uppercase the flag, replace
 | `--grpc-tls-cert-path` | — | Server certificate the controller presents to agents for mTLS |
 | `--grpc-tls-key-path` | — | Private key matching the server certificate |
 | `--grpc-tls-ca-path` | — | CA bundle used to verify agent client certificates |
-| `--redis-url` | — | Redis URL backing the cross-pod `agent→pod` registry; empty = in-memory single-replica mode |
+| `--redis-url` | — | Redis URL backing the cross-pod `agent→pod` registry; empty = in-memory single-replica mode. Supports standalone (`redis://`), sentinel (`redis+sentinel://host?master_name=...&addr=...`), and cluster (`redis+cluster://host?addr=...`) topologies |
 | `--peer-bind-address` | — | Bind address of the in-cluster ControllerPeer mTLS listener for cross-pod relay; empty = peer plane disabled |
 | `--peer-advertise-address` | — | Address siblings dial to reach this pod's peer listener (written as the registry value); required in cross-pod mode |
 | `--peer-tls-cert-path` / `--peer-tls-key-path` / `--peer-tls-ca-path` | — | mTLS material for the ControllerPeer plane (controller is both server and client) |
@@ -353,8 +365,8 @@ Items below are **non-negotiable** — do not deviate during implementation.
 - [x] Agent↔controller connection setup with **mTLS** (TLS 1.3, no insecure fallback), client-side and server-side
 - [x] Two-listener controller wiring (in-cluster plaintext default listener + ingress-facing mTLS gRPC listener), plus an optional third in-cluster ControllerPeer mTLS listener
 - [x] `Control` stream with `Hello` handshake and periodic `Heartbeat`
-- [x] Generic `AgentRequest`/`AgentResult` dispatch envelope + correlation; `GET /api/v1/agents/<id>/images` served by an agent-side Docker client (`images.list`)
-- [x] Redis `agent→pod` registry (write/CAD-delete/TTL-refresh) and cross-pod relay of API requests via `ControllerPeer.Dispatch`, with reject-and-retry on a stale mapping
+- [x] Generic `AgentRequest`/`AgentResult` dispatch envelope + correlation, with a streaming variant (`AgentProgress` frames + a `final` `AgentResult`); Docker **images** endpoints served by an agent-side Docker client: `GET` (`images.list`), `POST` (`images.pull`, streaming SSE progress), `DELETE` (`images.remove`) on `/api/v1/agents/<id>/images`, plus `GET /api/v1/agents`
+- [x] Redis `agent→pod` registry (write/CAD-delete/TTL-refresh; standalone/sentinel/cluster topologies) and cross-pod relay of API requests via `ControllerPeer.Dispatch` + `ControllerPeer.DispatchStream`, with reject-and-retry on a stale mapping
 - [x] Helm chart: StatefulSet + headless peer Service; optional Redis, peer plane, and cert-manager CSI cert issuance; multi-replica config guard
 
 ### In Progress / Planned (MVP)
