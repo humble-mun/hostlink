@@ -1,11 +1,11 @@
-# hostlink-agent configuration — install to /etc/humble-mun/agent.yaml
+# hostlink agent configuration — install to /etc/humble-mun/hostlink.yaml
 #
 # The agent reads this file at startup and watches it for changes (the chassis
 # calls viper.WatchConfig), so edits are picked up at runtime without a
 # `systemctl daemon-reload` and without restarting the unit. The lookup path is
-# fixed: the chassis registers SetConfigName("agent") + AddConfigPath("/etc/humble-mun"),
-# and the binary's name is "agent" (set via -ldflags version.Name at build), so
-# the file must live at /etc/humble-mun/agent.yaml.
+# fixed: the chassis registers SetConfigName("hostlink") + AddConfigPath("/etc/humble-mun"),
+# and the binary's name is "hostlink" (set via -ldflags version.Name at build), so
+# the file must live at /etc/humble-mun/hostlink.yaml.
 #
 # Keys are the flag names verbatim. Anything set here can also be overridden by
 # an HM_* environment variable (uppercase the key, replace '-' with '_', prefix
@@ -46,3 +46,14 @@ agent-tls-key-path: "/etc/humble-mun/agent/tls.key"
 # to empty — set it to the hostname (or another stable identifier) so the agent
 # is distinguishable on the controller side.
 node-name: ""
+
+# --------------------------------------------------------------------------
+# Working directory (fs API)
+# --------------------------------------------------------------------------
+
+# Directory whose contents the controller can browse, download, upload, and
+# delete through the fs API (GET/POST/PUT/DELETE /api/v1/agents/<id>/fs). Leave
+# empty to disable the fs API. The directory must already exist and be writable
+# by the agent user; the systemd unit provisions /var/lib/hostlink for this via
+# StateDirectory before the agent starts.
+data-dir: "/var/lib/hostlink"

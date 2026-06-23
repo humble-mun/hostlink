@@ -72,8 +72,8 @@ agent:
 			-ldflags \"$(LD_FLAGS) \
 			-X '$(BASE_PROJECT)/$(VERSION_PACKAGE).CommitID=\`git rev-parse HEAD 2>/dev/null\`' \
 			-X '$(BASE_PROJECT)/$(VERSION_PACKAGE).BuiltAt=\`date -u +%Y-%m-%dT%H:%M:%SZ\`' \
-			-X '$(BASE_PROJECT)/$(VERSION_PACKAGE).Name=$@' \
+			-X '$(BASE_PROJECT)/$(VERSION_PACKAGE).Name=hostlink' \
 			-X '$(BASE_PROJECT)/$(VERSION_PACKAGE).Architecture=$(ARCH)' \
 			-X '$(BASE_PROJECT)/$(VERSION_PACKAGE).Variant=$(VARIANT)' \
 			-X '$(BASE_PROJECT)/$(VERSION_PACKAGE).RecentCommits=\`git log -n 20 --oneline 2>/dev/null | tr \"\\n\" \";\"\`'\" \
-			-o $@.elf $(PROJECT)/cmd/$@"
+			-o hostlink.elf $(PROJECT)/cmd/$@"

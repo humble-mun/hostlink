@@ -13,6 +13,7 @@ import (
 	redisv9 "github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
 
+	"github.com/humble-mun/hostlink/pkg/agentapi"
 	hostlinkv1 "github.com/humble-mun/hostlink/pkg/api/hostlink/v1"
 )
 
@@ -212,19 +213,45 @@ type agentConn struct {
 
 	mu            sync.Mutex
 	pending       map[string]chan *hostlinkv1.AgentResult
-	pendingStream map[string]chan streamFrame
+	pendingStream map[string]*streamReg
 	closed        bool
 	seq           atomic.Uint64
 }
 
 // streamFrame is one delivery on a streaming dispatch's channel: either a
 // progress frame (Final false, Payload carries the method-specific progress
-// JSON) or the terminal frame (Final true, Code/Error report the outcome).
+// JSON or raw bytes) or the terminal frame (Final true, Code/Error report the
+// outcome).
 type streamFrame struct {
 	Payload []byte
 	Code    uint32
 	Error   string
 	Final   bool
+}
+
+// streamReg is the registration backing one streaming dispatch. The consumer
+// reads frames from ch and watches done for an abnormal end (agent disconnect or
+// caller cancel); end-of-stream proper is the terminal frame (Final true).
+// reliable selects backpressure (file data must not be dropped) over the
+// advisory drop-on-full used for progress (e.g. images.pull). done is closed at
+// most once (guarded by once), by whichever of cancel/closeAll fires first, so a
+// writer blocked on ch can never panic on a closed channel.
+type streamReg struct {
+	ch       chan streamFrame
+	done     chan struct{}
+	reliable bool
+	once     sync.Once
+}
+
+func (r *streamReg) close() {
+	r.once.Do(func() { close(r.done) })
+}
+
+// streamReliable reports whether a streaming method requires lossless delivery.
+// File reads carry bytes that must never be dropped; progress streams (images.pull)
+// are advisory and may drop frames under a slow consumer.
+func streamReliable(method string) bool {
+	return method == agentapi.MethodFsRead
 }
 
 func newAgentConn(agentID string, stream grpc.BidiStreamingServer[hostlinkv1.AgentEvent, hostlinkv1.Command], logger logr.Logger) *agentConn {
@@ -233,7 +260,7 @@ func newAgentConn(agentID string, stream grpc.BidiStreamingServer[hostlinkv1.Age
 		logger:        logger,
 		stream:        stream,
 		pending:       make(map[string]chan *hostlinkv1.AgentResult),
-		pendingStream: make(map[string]chan streamFrame),
+		pendingStream: make(map[string]*streamReg),
 	}
 }
 
@@ -284,15 +311,17 @@ func (c *agentConn) dispatch(ctx context.Context, method string, payload []byte)
 }
 
 // dispatchStream drives a streaming method to the agent and returns a channel of
-// frames: zero or more progress frames followed by exactly one terminal frame
-// (Final true), after which the channel is closed. The channel is buffered and
-// progress sends are non-blocking dropped, so a slow consumer can never stall the
-// shared Control stream. The caller must drain until the channel is closed; the
-// returned cancel removes the pending registration and must be called when the
-// caller stops reading (e.g. its context ends).
-func (c *agentConn) dispatchStream(_ context.Context, method string, payload []byte) (frames <-chan streamFrame, cancel func(), err error) {
+// frames (zero or more progress frames followed by exactly one terminal frame
+// with Final true) plus a done channel that closes on an abnormal end (agent
+// disconnect or cancel). The channel is never closed by the writer; the consumer
+// detects end-of-stream from the terminal frame and abnormal end from done.
+// Reliable methods (fs.read) get lossless backpressure; others drop progress on a
+// full buffer so a slow consumer can never stall the shared Control stream. The
+// returned cancel removes the registration and must be called when the caller
+// stops reading (e.g. its context ends).
+func (c *agentConn) dispatchStream(_ context.Context, method string, payload []byte) (frames <-chan streamFrame, done <-chan struct{}, cancel func(), err error) {
 	requestID := strconv.FormatUint(c.seq.Add(1), 10)
-	ch := make(chan streamFrame, 64)
+	reg := &streamReg{ch: make(chan streamFrame, 64), done: make(chan struct{}), reliable: streamReliable(method)}
 
 	c.mu.Lock()
 	if c.closed {
@@ -300,13 +329,16 @@ func (c *agentConn) dispatchStream(_ context.Context, method string, payload []b
 		err = errAgentDisconnected
 		return
 	}
-	c.pendingStream[requestID] = ch
+	c.pendingStream[requestID] = reg
 	c.mu.Unlock()
 
 	cancel = func() {
 		c.mu.Lock()
-		delete(c.pendingStream, requestID)
+		if c.pendingStream[requestID] == reg {
+			delete(c.pendingStream, requestID)
+		}
 		c.mu.Unlock()
+		reg.close()
 	}
 
 	if err = c.send(&hostlinkv1.Command{
@@ -322,7 +354,80 @@ func (c *agentConn) dispatchStream(_ context.Context, method string, payload []b
 		cancel = nil
 		return
 	}
-	frames = ch
+	frames = reg.ch
+	done = reg.done
+	return
+}
+
+// uploadDispatch is a controller-side handle to an in-flight streaming upload to
+// the agent. The opening AgentRequest has been sent; the caller streams the body
+// with sendChunk and awaits the terminal result with await.
+type uploadDispatch struct {
+	conn      *agentConn
+	requestID string
+	result    chan *hostlinkv1.AgentResult
+}
+
+// dispatchUpload opens a streaming upload: it sends the opening AgentRequest and
+// registers a pending result channel, returning a handle the caller drives. The
+// agent's terminal AgentResult is routed back through the unary pending path.
+func (c *agentConn) dispatchUpload(method string, payload []byte) (up *uploadDispatch, err error) {
+	requestID := strconv.FormatUint(c.seq.Add(1), 10)
+	ch := make(chan *hostlinkv1.AgentResult, 1)
+
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		err = errAgentDisconnected
+		return
+	}
+	c.pending[requestID] = ch
+	c.mu.Unlock()
+
+	if err = c.send(&hostlinkv1.Command{
+		Cmd: &hostlinkv1.Command_Request{
+			Request: &hostlinkv1.AgentRequest{RequestId: requestID, Method: method, Payload: payload},
+		},
+	}); err != nil {
+		c.mu.Lock()
+		delete(c.pending, requestID)
+		c.mu.Unlock()
+		return
+	}
+	up = &uploadDispatch{conn: c, requestID: requestID, result: ch}
+	return
+}
+
+// sendChunk streams one body chunk to the agent. The underlying stream Send
+// blocks under gRPC flow control when the agent is slow, so this provides upload
+// backpressure. last marks the final chunk.
+func (up *uploadDispatch) sendChunk(data []byte, last bool) (err error) {
+	err = up.conn.send(&hostlinkv1.Command{
+		Cmd: &hostlinkv1.Command_Chunk{
+			Chunk: &hostlinkv1.AgentRequestChunk{RequestId: up.requestID, Data: data, Last: last},
+		},
+	})
+	return
+}
+
+// await blocks until the agent's terminal AgentResult arrives, ctx is done, or
+// the stream closes. It removes the pending registration on return.
+func (up *uploadDispatch) await(ctx context.Context) (result *hostlinkv1.AgentResult, err error) {
+	defer func() {
+		up.conn.mu.Lock()
+		delete(up.conn.pending, up.requestID)
+		up.conn.mu.Unlock()
+	}()
+	select {
+	case <-ctx.Done():
+		err = ctx.Err()
+	case r, ok := <-up.result:
+		if !ok {
+			err = errAgentDisconnected
+			return
+		}
+		result = r
+	}
 	return
 }
 
@@ -337,60 +442,83 @@ func (c *agentConn) send(cmd *hostlinkv1.Command) (err error) {
 	return
 }
 
-// deliver routes a terminal AgentResult to its waiting dispatcher. It first
-// looks for a streaming request (delivering a terminal frame and closing the
-// stream), then a unary one. Each unary request has its own buffered (cap 1)
-// channel, so the send never blocks while holding mu.
+// deliver routes a terminal AgentResult to its waiting dispatcher. It first looks
+// for a streaming request (delivering a terminal frame), then a unary one (which
+// covers both plain dispatch and the streaming-upload result). The registration is
+// removed under mu, then the send happens off-lock: a streaming send races the
+// reg's done so a stopped consumer cannot block it, and each unary channel is
+// buffered (cap 1) so its send never blocks.
 func (c *agentConn) deliver(result *hostlinkv1.AgentResult) {
 	requestID := result.GetRequestId()
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if sch, ok := c.pendingStream[requestID]; ok {
-		sch <- streamFrame{Payload: result.GetPayload(), Code: result.GetCode(), Error: result.GetError(), Final: true}
-		close(sch)
+	if reg, ok := c.pendingStream[requestID]; ok {
 		delete(c.pendingStream, requestID)
+		c.mu.Unlock()
+		select {
+		case reg.ch <- streamFrame{Payload: result.GetPayload(), Code: result.GetCode(), Error: result.GetError(), Final: true}:
+		case <-reg.done:
+		}
 		return
 	}
 	ch, ok := c.pending[requestID]
 	if !ok {
+		c.mu.Unlock()
 		c.logger.Info("dropping agent result with no pending request", "requestID", requestID)
 		return
 	}
-	ch <- result
 	delete(c.pending, requestID)
+	c.mu.Unlock()
+	ch <- result
 }
 
-// deliverProgress routes an AgentProgress frame to its streaming dispatcher.
-// Delivery is non-blocking: if the consumer's buffer is full the frame is
-// dropped (progress is advisory and must never stall the shared Control stream).
+// deliverProgress routes an AgentProgress frame to its streaming dispatcher. The
+// send happens off-lock and races the reg's done so a torn-down stream never
+// blocks the receive loop. For a reliable stream the send blocks for backpressure
+// (file bytes must not be dropped); otherwise a full buffer drops the frame
+// (progress is advisory).
 func (c *agentConn) deliverProgress(progress *hostlinkv1.AgentProgress) {
 	requestID := progress.GetRequestId()
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	sch, ok := c.pendingStream[requestID]
+	reg, ok := c.pendingStream[requestID]
+	c.mu.Unlock()
 	if !ok {
 		c.logger.Info("dropping agent progress with no pending stream", "requestID", requestID)
 		return
 	}
+	frame := streamFrame{Payload: progress.GetPayload()}
+	if reg.reliable {
+		select {
+		case reg.ch <- frame:
+		case <-reg.done:
+		}
+		return
+	}
 	select {
-	case sch <- streamFrame{Payload: progress.GetPayload()}:
+	case reg.ch <- frame:
+	case <-reg.done:
 	default:
 		c.logger.Info("dropping agent progress: consumer buffer full", "requestID", requestID)
 	}
 }
 
-// closeAll marks the connection closed and unblocks every outstanding
-// dispatcher with errAgentDisconnected. Called once when the Control stream ends.
+// closeAll marks the connection closed and unblocks every outstanding dispatcher
+// with errAgentDisconnected. Unary waiters are woken by closing their channel;
+// streaming consumers (and any writer mid-send) are woken by closing each reg's
+// done. Called once when the Control stream ends.
 func (c *agentConn) closeAll() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.closed = true
 	for requestID, ch := range c.pending {
 		close(ch)
 		delete(c.pending, requestID)
 	}
-	for requestID, sch := range c.pendingStream {
-		close(sch)
+	regs := make([]*streamReg, 0, len(c.pendingStream))
+	for requestID, reg := range c.pendingStream {
+		regs = append(regs, reg)
 		delete(c.pendingStream, requestID)
+	}
+	c.mu.Unlock()
+	for _, reg := range regs {
+		reg.close()
 	}
 }

@@ -1,8 +1,11 @@
 package main
 
 import (
+	"time"
+
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 
 	"github.com/humble-mun/chassis/pkg/app"
 	"github.com/humble-mun/chassis/pkg/metrics"
@@ -17,7 +20,7 @@ func newRootCommand() *cobra.Command {
 		Use:   version.Name,
 		Short: "hostlink-controller is the cloud-side control plane that manages external hosts and their containers.",
 		Long: "hostlink-controller is the cloud-side component of hostlink. It runs in Kubernetes (with multiple " +
-			"replicas for HA) and acts as the gRPC server that NAT-side hostlink-agents dial out to over a " +
+			"replicas for HA) and acts as the gRPC server that NAT-side hostlink agents dial out to over a" +
 			"persistent connection. It dispatches Docker and exposure commands to agents, aggregates their " +
 			"metrics into a single Prometheus endpoint, and drives reverse TCP tunnels for dynamic port forwarding.",
 		FParseErrWhitelist: cobra.FParseErrWhitelist{
@@ -28,7 +31,16 @@ func newRootCommand() *cobra.Command {
 		},
 		SilenceUsage: true,
 		RunE: func(_ *cobra.Command, _ []string) (err error) {
-			srv := grpc.NewServer()
+			// Accept the agent's keepalive pings: MinTime must be <= the agent's
+			// keepalive Time and PermitWithoutStream must match its client setting,
+			// otherwise the server answers a too-frequent ping with GOAWAY
+			// too_many_pings and drops the very connection keepalive is meant to hold.
+			srv := grpc.NewServer(
+				grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+					MinTime:             10 * time.Second,
+					PermitWithoutStream: true,
+				}),
+			)
 			var base app.Base
 			if base, err = app.BaseContext(
 				app.WithInit(init),

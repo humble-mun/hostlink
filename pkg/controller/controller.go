@@ -118,6 +118,10 @@ func (svc *service) RegisterRoute(mux *gin.Engine) {
 	group.POST("/agents/:agentId/images", svc.pullAgentImage)
 	group.DELETE("/agents/:agentId/images", svc.removeAgentImages)
 	group.DELETE("/agents/:agentId/images/:imageId", svc.removeAgentImages)
+	group.GET("/agents/:agentId/files", svc.fsGet)
+	group.POST("/agents/:agentId/files", svc.fsPost)
+	group.PUT("/agents/:agentId/files", svc.fsPut)
+	group.DELETE("/agents/:agentId/files", svc.fsDelete)
 }
 
 func (svc *service) Close() (err error) {

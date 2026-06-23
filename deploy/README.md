@@ -1,12 +1,12 @@
-# hostlink-agent — manual installation
+# hostlink — manual installation
 
-This directory holds everything needed to install `hostlink-agent` on an
+This directory holds everything needed to install `hostlink` on an
 external Linux host (on-prem / colo, behind NAT) as a **systemd service**:
 
 ```
 deploy/
-├── hostlink-agent.service   the systemd unit (no flags — config lives in the YAML)
-└── agent.yaml               documented example config, installs to /etc/humble-mun/agent.yaml
+├── hostlink.service   the systemd unit (no flags — config lives in the YAML)
+└── hostlink.yaml               documented example config, installs to /etc/humble-mun/hostlink.yaml
 ```
 
 The agent is a single static Go binary. It dials **outbound** to the cloud-side
@@ -39,6 +39,12 @@ the `docker` group — see [Step 4](#step-4--create-the-service-user)). The agen
 itself still starts and runs the `Control` stream (`Hello` + `Heartbeat`) without
 Docker, so the unit keeps `docker.service` as a soft (`Wants`) dependency.
 
+The agent also serves a **working-directory filesystem** API
+(`GET`/`POST`/`PUT`/`DELETE /api/v1/agents/<id>/files` — browse, download,
+multipart upload, recursive delete) over the directory set by `data-dir`
+(default `/var/lib/hostlink`, provisioned by the unit's `StateDirectory` — see
+[Step 5](#step-5--install-and-start-the-unit)). This needs no Docker.
+
 ## Step 1 — build and install the binary
 
 Build the agent (the module is vendored; build offline with `-mod=vendor`). On a
@@ -46,17 +52,18 @@ non-Linux dev machine, cross-compile or build inside a Linux container — see t
 top-level [README](../README.md#build):
 
 ```bash
-GOOS=linux GOARCH=amd64 go build -mod=vendor -o bin/hostlink-agent ./cmd/agent
+GOOS=linux GOARCH=amd64 go build -mod=vendor -o bin/hostlink ./cmd/agent
 ```
 
 Copy it onto the host and install it where the unit expects it:
 
 ```bash
-sudo install -m 0755 bin/hostlink-agent /usr/local/bin/hostlink-agent
+sudo install -m 0755 bin/hostlink /usr/local/bin/hostlink
 ```
 
-> The binary is prefixed `hostlink-` so it does not collide with some other
-> `agent` in `ps`, in packaging, or in systemd units.
+> The agent is the only hostlink component that runs under systemd (the
+> controller runs in Kubernetes), so the binary and unit are named simply
+> `hostlink`.
 
 ## Step 2 — install the mTLS material
 
@@ -94,15 +101,15 @@ sudo install -m 0640 debug/pki/agent/agent-demo/tls.key /etc/humble-mun/agent/tl
 
 ## Step 3 — write the configuration
 
-The agent reads **all** of its settings from `/etc/humble-mun/agent.yaml`. The
-lookup path is fixed (the chassis registers `SetConfigName("agent")` +
-`AddConfigPath("/etc/humble-mun")`, and the binary's name is `agent`), so the
+The agent reads **all** of its settings from `/etc/humble-mun/hostlink.yaml`. The
+lookup path is fixed (the chassis registers `SetConfigName("hostlink")` +
+`AddConfigPath("/etc/humble-mun")`, and the binary's name is `hostlink`), so the
 file must live exactly there. Copy the documented template from this directory
 and edit it:
 
 ```bash
-sudo install -m 0644 deploy/agent.yaml /etc/humble-mun/agent.yaml
-sudo $EDITOR /etc/humble-mun/agent.yaml
+sudo install -m 0644 deploy/hostlink.yaml /etc/humble-mun/hostlink.yaml
+sudo $EDITOR /etc/humble-mun/hostlink.yaml
 ```
 
 The keys are the flag names verbatim:
@@ -115,6 +122,7 @@ The keys are the flag names verbatim:
 | `agent-tls-cert-path` | yes | Path to `tls.crt` (default `/etc/humble-mun/agent/tls.crt`) |
 | `agent-tls-key-path` | yes | Path to `tls.key` (default `/etc/humble-mun/agent/tls.key`) |
 | `node-name` | recommended | Logical name for this host; becomes the `agent_id` the controller sees — set it to the hostname or another stable identifier |
+| `data-dir` | recommended | Working directory the `files` API browses/serves (`/var/lib/hostlink` in the shipped config). Empty disables the `files` API. Let the unit's `StateDirectory` create and own it — do **not** `mkdir`/`chown` it by hand (see [Step 5](#step-5--install-and-start-the-unit)) |
 
 A minimal config (matching the debug PKI's `agent-demo`):
 
@@ -152,24 +160,26 @@ sudo chmod 0640 /etc/humble-mun/agent/tls.key
 ## Step 5 — install and start the unit
 
 ```bash
-sudo install -m 0644 deploy/hostlink-agent.service /etc/systemd/system/hostlink-agent.service
+sudo install -m 0644 deploy/hostlink.service /etc/systemd/system/hostlink.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now hostlink-agent
+sudo systemctl enable --now hostlink
 ```
 
-The unit reconnects on any exit with a short backoff (`Restart=always`,
-`RestartSec=5s`), but a hard-failing config (bad or missing certs, empty
-`controller-endpoint`) is rate-limited by `StartLimitIntervalSec=60` /
-`StartLimitBurst=5` so it does not hot-loop forever.
+The agent reconnects to the controller **in-process** (exponential backoff +
+HTTP/2 keepalive), so a controller restart, redeploy, or transient network drop
+is recovered without the process exiting. `Restart=always` / `RestartSec=5s` is
+only the fallback for a genuine process exit — e.g. a hard-failing config (bad or
+missing certs, empty `controller-endpoint`) — and `StartLimitIntervalSec=60` /
+`StartLimitBurst=5` keeps such a fatal config from hot-looping forever.
 
 ## Step 6 — verify
 
 ```bash
 # Is the unit up?
-systemctl status hostlink-agent
+systemctl status hostlink
 
-# Follow the logs (the unit logs to the journal under SyslogIdentifier=hostlink-agent):
-journalctl -u hostlink-agent -f
+# Follow the logs (the unit logs to the journal under SyslogIdentifier=hostlink):
+journalctl -u hostlink -f
 ```
 
 A healthy agent logs `agent started`, establishes the mTLS connection, sends a
@@ -193,10 +203,10 @@ must line up.
 ## Uninstall
 
 ```bash
-sudo systemctl disable --now hostlink-agent
-sudo rm /etc/systemd/system/hostlink-agent.service
+sudo systemctl disable --now hostlink
+sudo rm /etc/systemd/system/hostlink.service
 sudo systemctl daemon-reload
-sudo rm -rf /etc/humble-mun/agent /etc/humble-mun/agent.yaml
-sudo rm /usr/local/bin/hostlink-agent
+sudo rm -rf /etc/humble-mun/agent /etc/humble-mun/hostlink.yaml
+sudo rm /usr/local/bin/hostlink
 sudo userdel hostlink
 ```

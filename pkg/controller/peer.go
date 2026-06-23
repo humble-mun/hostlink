@@ -69,7 +69,7 @@ func (s *peerServer) DispatchStream(req *hostlinkv1.DispatchRequest, stream grpc
 		return status.Errorf(codes.FailedPrecondition, "agent %q not held by this controller", agentID)
 	}
 	ctx := stream.Context()
-	frames, cancel, derr := conn.dispatchStream(ctx, req.GetRequest().GetMethod(), req.GetRequest().GetPayload())
+	frames, done, cancel, derr := conn.dispatchStream(ctx, req.GetRequest().GetMethod(), req.GetRequest().GetPayload())
 	if derr != nil {
 		s.logger.Error(derr, "relayed stream dispatch to agent failed", "agentID", agentID)
 		if errors.Is(derr, errAgentDisconnected) {
@@ -78,28 +78,104 @@ func (s *peerServer) DispatchStream(req *hostlinkv1.DispatchRequest, stream grpc
 		return status.Errorf(codes.Internal, "dispatch to agent %q failed", agentID)
 	}
 	defer cancel()
+
+	forward := func(frame streamFrame) error {
+		return stream.Send(&hostlinkv1.AgentResult{
+			RequestId: req.GetRequest().GetRequestId(),
+			Payload:   frame.Payload,
+			Code:      frame.Code,
+			Error:     frame.Error,
+			Final:     frame.Final,
+		})
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case frame, ok := <-frames:
-			if !ok {
-				return status.Errorf(codes.FailedPrecondition, "agent %q disconnected during dispatch", agentID)
-			}
-			if err = stream.Send(&hostlinkv1.AgentResult{
-				RequestId: req.GetRequest().GetRequestId(),
-				Payload:   frame.Payload,
-				Code:      frame.Code,
-				Error:     frame.Error,
-				Final:     frame.Final,
-			}); err != nil {
+		case frame := <-frames:
+			if err = forward(frame); err != nil {
 				return fmt.Errorf("forward agent %q result frame: %w", agentID, err)
 			}
 			if frame.Final {
 				return nil
 			}
+		case <-done:
+			// The agent disconnected; drain any frames already delivered (a terminal
+			// frame among them still completes the stream) before reporting it.
+			for {
+				select {
+				case frame := <-frames:
+					if err = forward(frame); err != nil {
+						return fmt.Errorf("forward agent %q result frame: %w", agentID, err)
+					}
+					if frame.Final {
+						return nil
+					}
+				default:
+					return status.Errorf(codes.FailedPrecondition, "agent %q disconnected during dispatch", agentID)
+				}
+			}
 		}
 	}
+}
+
+// Upload resolves the agent locally and drives a streaming upload to it. The
+// first frame carries the routing key and the opening AgentRequest; each
+// following frame carries a body chunk, the last marked last=true. A stale
+// mapping is rejected with FAILED_PRECONDITION so the caller re-resolves and
+// retries.
+func (s *peerServer) Upload(stream grpc.ClientStreamingServer[hostlinkv1.UploadFrame, hostlinkv1.AgentResult]) (err error) {
+	var first *hostlinkv1.UploadFrame
+	if first, err = stream.Recv(); err != nil {
+		return status.Errorf(codes.InvalidArgument, "receive opening upload frame: %v", err)
+	}
+	open := first.GetOpen()
+	if open == nil {
+		return status.Errorf(codes.InvalidArgument, "first upload frame must carry the open request")
+	}
+	agentID := open.GetAgentId()
+	conn, ok := s.registry.get(agentID)
+	if !ok {
+		return status.Errorf(codes.FailedPrecondition, "agent %q not held by this controller", agentID)
+	}
+
+	var up *uploadDispatch
+	if up, err = conn.dispatchUpload(open.GetRequest().GetMethod(), open.GetRequest().GetPayload()); err != nil {
+		s.logger.Error(err, "relayed upload open to agent failed", "agentID", agentID)
+		if errors.Is(err, errAgentDisconnected) {
+			return status.Errorf(codes.FailedPrecondition, "agent %q disconnected during upload", agentID)
+		}
+		return status.Errorf(codes.Internal, "upload to agent %q failed", agentID)
+	}
+
+	for {
+		var frame *hostlinkv1.UploadFrame
+		if frame, err = stream.Recv(); err != nil {
+			if errors.Is(err, io.EOF) {
+				// The caller closed without a terminal chunk (its source aborted). Stop
+				// forwarding; the agent aborts the partial write on its idle timeout.
+				return status.Errorf(codes.Aborted, "upload from caller ended before completion")
+			}
+			return status.Errorf(codes.Internal, "receive upload chunk: %v", err)
+		}
+		if err = up.sendChunk(frame.GetChunk(), frame.GetLast()); err != nil {
+			s.logger.Error(err, "forward upload chunk to agent failed", "agentID", agentID)
+			return status.Errorf(codes.Internal, "upload to agent %q failed", agentID)
+		}
+		if frame.GetLast() {
+			break
+		}
+	}
+
+	var result *hostlinkv1.AgentResult
+	if result, err = up.await(stream.Context()); err != nil {
+		s.logger.Error(err, "await relayed upload result failed", "agentID", agentID)
+		if errors.Is(err, errAgentDisconnected) {
+			return status.Errorf(codes.FailedPrecondition, "agent %q disconnected during upload", agentID)
+		}
+		return status.Errorf(codes.Internal, "upload to agent %q failed", agentID)
+	}
+	return stream.SendAndClose(result)
 }
 
 // peerClients dials sibling controllers' ControllerPeer listeners and caches one
@@ -140,11 +216,14 @@ func (p *peerClients) dispatch(ctx context.Context, addr, agentID, method string
 }
 
 // dispatchStream relays a streaming request to the controller at addr, returning
-// a channel of frames (progress frames followed by the terminal frame) closed
-// when the relay ends. A FAILED_PRECONDITION from the sibling (its mapping was
-// stale) is normalized to errAgentNotConnected so the REST layer reports a 404.
-// The caller must cancel ctx to release the relay goroutine.
-func (p *peerClients) dispatchStream(ctx context.Context, addr, agentID, method string, payload []byte) (frames <-chan streamFrame, err error) {
+// a channel of frames (progress frames followed by the terminal frame) plus a
+// done channel that closes when the relay ends (the terminal frame is the normal
+// end; done closing without one signals an abnormal end). The channel is never
+// closed by the relay goroutine, mirroring the local dispatchStream contract. A
+// FAILED_PRECONDITION from the sibling (its mapping was stale) is normalized to
+// errAgentNotConnected so the REST layer reports a 404. The caller must cancel
+// ctx to release the relay goroutine.
+func (p *peerClients) dispatchStream(ctx context.Context, addr, agentID, method string, payload []byte) (frames <-chan streamFrame, done <-chan struct{}, err error) {
 	var conn *grpc.ClientConn
 	if conn, err = p.conn(addr); err != nil {
 		return
@@ -161,9 +240,10 @@ func (p *peerClients) dispatchStream(ctx context.Context, addr, agentID, method 
 		return
 	}
 	ch := make(chan streamFrame, 64)
-	frames = ch
+	d := make(chan struct{})
+	frames, done = ch, d
 	go func() {
-		defer close(ch)
+		defer close(d)
 		for {
 			result, rerr := relay.Recv()
 			if rerr != nil {
@@ -188,6 +268,41 @@ func (p *peerClients) dispatchStream(ctx context.Context, addr, agentID, method 
 			}
 		}
 	}()
+	return
+}
+
+// upload relays a streaming controller->agent upload to the controller at addr:
+// it opens the Upload stream, sends the opening request, streams body in
+// fsUploadChunkSize chunks, and returns the agent's terminal result. A
+// FAILED_PRECONDITION from the sibling (its mapping was stale) is normalized to
+// errAgentNotConnected so the REST layer reports a 404.
+func (p *peerClients) upload(ctx context.Context, addr, agentID, method string, openPayload []byte, body io.Reader) (result *hostlinkv1.AgentResult, err error) {
+	var conn *grpc.ClientConn
+	if conn, err = p.conn(addr); err != nil {
+		return
+	}
+	client := hostlinkv1.NewControllerPeerClient(conn)
+	var stream grpc.ClientStreamingClient[hostlinkv1.UploadFrame, hostlinkv1.AgentResult]
+	if stream, err = client.Upload(ctx); err != nil {
+		return
+	}
+	if err = stream.Send(&hostlinkv1.UploadFrame{Kind: &hostlinkv1.UploadFrame_Open{Open: &hostlinkv1.DispatchRequest{
+		AgentId: agentID,
+		Request: &hostlinkv1.AgentRequest{Method: method, Payload: openPayload},
+	}}}); err != nil {
+		return
+	}
+	if err = streamUploadBody(body, func(data []byte, last bool) error {
+		return stream.Send(&hostlinkv1.UploadFrame{Kind: &hostlinkv1.UploadFrame_Chunk{Chunk: data}, Last: last})
+	}); err != nil {
+		return
+	}
+	if result, err = stream.CloseAndRecv(); err != nil {
+		if status.Code(err) == codes.FailedPrecondition {
+			err = errAgentNotConnected
+		}
+		return
+	}
 	return
 }
 

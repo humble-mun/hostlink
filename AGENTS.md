@@ -11,7 +11,7 @@
 It builds two binaries:
 
 - **`hostlink-controller`** — runs in the cloud (inside Kubernetes). The control plane.
-- **`hostlink-agent`** — runs on each external host (behind NAT). Executes commands, reports metrics, carries tunnels.
+- **`hostlink`** — runs on each external host (behind NAT). Executes commands, reports metrics, carries tunnels.
 
 **Scale assumptions:** roughly a dozen agents, a few dozen at most. Many choices favor "good enough, controllable, debuggable." Do not over-engineer for massive scale.
 
@@ -27,7 +27,7 @@ A single Go module; one binary per subdirectory under `cmd/` (the standard Go la
 github.com/humble-mun/hostlink
 ├── cmd/
 │   ├── controller/   main.go    # builds hostlink-controller (cloud)
-│   └── agent/        main.go    # builds hostlink-agent (host)
+│   └── agent/        main.go    # builds hostlink (host)
 ├── pkg/
 │   ├── agent/                    # agent runtime: dial-out, mTLS client creds, Control stream, docker client, request handlers (commands.go)
 │   ├── agentapi/                 # shared wire contract for the generic AgentRequest plane (method names + JSON payload shapes)
@@ -43,10 +43,10 @@ Build:
 
 ```bash
 go build -o bin/hostlink-controller ./cmd/controller
-go build -o bin/hostlink-agent      ./cmd/agent
+go build -o bin/hostlink      ./cmd/agent
 ```
 
-> Binaries are deliberately prefixed with `hostlink-` so that on the host they don't collide with some other `agent` in `ps`, in packaging, or in systemd units. Optionally prefix the project itself as `ruyun-hostlink` if you want to make Smoothcloud ownership explicit.
+> The agent is the only hostlink binary installed on a host, so it is named simply `hostlink`; the cloud-side control plane keeps the `hostlink-controller` name. Optionally prefix the project itself as `ruyun-hostlink` if you want to make Smoothcloud ownership explicit.
 
 ---
 
@@ -137,7 +137,7 @@ This handshake + chunking + session pairing is **provided by `openconfig/grpctun
 
 The controller runs multiple replicas (required for HA). **The affinity problem:** an agent's connection is pinned to the **one** pod it dialed; public TCP arriving through the L4 LB lands on **any** replica, and the receiving pod is usually not the one holding that agent.
 
-> **Implementation status.** The `agent:<id> → holding_pod` Redis map (write on connect, compare-and-delete on disconnect, TTL refreshed by heartbeat) and the cross-pod relay for **API requests** — `ControllerPeer.Dispatch` (unary) and `ControllerPeer.DispatchStream` (streaming, e.g. the SSE image pull) over a dedicated in-cluster mTLS listener, with reject-and-retry on a stale mapping — are **implemented** (see §6). What is **not** implemented yet: the `port:<P>` map and atomic port allocation, and the cross-pod relay of the **port-forward data plane** (the two byte-pipe hops). The description below is the full design for that data-plane path; today only the request-dispatch relay exists.
+> **Implementation status.** The `agent:<id> → holding_pod` Redis map (write on connect, compare-and-delete on disconnect, TTL refreshed by heartbeat) and the cross-pod relay for **API requests** — `ControllerPeer.Dispatch` (unary), `ControllerPeer.DispatchStream` (streaming, e.g. the SSE image pull or `fs.read` download), and `ControllerPeer.Upload` (client-streaming, e.g. the `fs.write` upload) over a dedicated in-cluster mTLS listener, with reject-and-retry on a stale mapping — are **implemented** (see §6). What is **not** implemented yet: the `port:<P>` map and atomic port allocation, and the cross-pod relay of the **port-forward data plane** (the two byte-pipe hops). The description below is the full design for that data-plane path; today only the request-dispatch relay exists.
 
 - **Routing key:** for raw TCP the only key available at ingress is the **destination port** (there is no Host header). Each exposure = one distinct public port.
 - **Registry (Redis dual maps):**
@@ -192,10 +192,14 @@ service ControllerPeer {
   // caller re-resolves and retries.
   rpc Dispatch(DispatchRequest) returns (AgentResult);
 
-  // Streaming variant for long-running ops (e.g. images.pull): each streamed
-  // AgentResult is a progress frame except the last (final = true), which carries
-  // the terminal code/payload/error.
+  // Streaming variant for long-running ops (e.g. images.pull, fs.read): each
+  // streamed AgentResult is a progress frame except the last (final = true),
+  // which carries the terminal code/payload/error.
   rpc DispatchStream(DispatchRequest) returns (stream AgentResult);
+
+  // Client-streaming relay of a controller->agent upload (e.g. fs.write): the
+  // first UploadFrame carries the open (DispatchRequest), the rest body chunks.
+  rpc Upload(stream UploadFrame) returns (AgentResult);
 }
 
 message AgentEvent {
@@ -218,6 +222,7 @@ message Command {
     DockerOp     docker_op    = 2; // run/stop/start/pause/unpause/rm
     ExposeRule   expose_rule  = 3; // add/remove a port-exposure rule
     AgentRequest request      = 4; // generic API-driven request (containers/images/...)
+    AgentRequestChunk chunk   = 5; // body chunk for a streaming upload (e.g. fs.write)
   }
 }
 message OpenForward { string session_id = 1; string target = 2; } // target = container-side addr, e.g. 172.30.1.5:8080
@@ -227,10 +232,12 @@ message ExposeRule  { string container_target = 1; uint32 public_port = 2; bool 
 // Generic method-dispatched request/result, correlated by request_id. method names
 // the operation (e.g. "images.list"); payload is its JSON body; code mirrors an HTTP
 // status. DispatchRequest wraps it with the agent_id routing key for the peer hop.
-message AgentRequest    { string request_id = 1; string method = 2; bytes payload = 3; }
-message AgentResult     { string request_id = 1; uint32 code = 2; bytes payload = 3; string error = 4; bool final = 5; } // final marks the terminal frame of a (possibly streamed) reply
-message AgentProgress   { string request_id = 1; bytes payload = 2; } // method-specific progress JSON (e.g. images.pull layer status)
-message DispatchRequest { string agent_id = 1; AgentRequest request = 2; }
+message AgentRequest      { string request_id = 1; string method = 2; bytes payload = 3; }
+message AgentRequestChunk { string request_id = 1; bytes data = 2; bool last = 3; } // one body chunk of a streaming upload request
+message AgentResult       { string request_id = 1; uint32 code = 2; bytes payload = 3; string error = 4; bool final = 5; } // final marks the terminal frame of a (possibly streamed) reply
+message AgentProgress     { string request_id = 1; bytes payload = 2; } // method-specific progress (e.g. images.pull layer status JSON, or fs.read file bytes)
+message DispatchRequest   { string agent_id = 1; AgentRequest request = 2; }
+message UploadFrame       { oneof kind { DispatchRequest open = 1; bytes chunk = 2; } bool last = 3; } // ControllerPeer.Upload stream: first frame open, rest body chunks
 
 message Frame {
   string session_id = 1;            // set on the first frame of a Forward stream, for pairing
@@ -270,11 +277,11 @@ relay(localTCP, frameStream):
 
 > **Infra decision (decoupled from the Go code):** confirm that the Cilium LB / your NLB can handle a port range of the needed size; if not, shrink the range or evaluate the Gateway API `TCPRoute`.
 
-### hostlink-agent (external host)
+### hostlink (external host)
 
-- Form: a static Go binary (installed as `/usr/local/bin/hostlink-agent`) running as a **systemd service**; the unit and an example config live in `deploy/` (`deploy/hostlink-agent.service`, `deploy/agent.yaml`).
-- Configuration: the agent reads all settings from `/etc/humble-mun/agent.yaml` (the chassis registers viper `SetConfigName("agent")` + `AddConfigPath("/etc/humble-mun")`; the binary's `version.Name` is `agent`). The systemd unit passes **no** command-line flags so config edits need no `daemon-reload`, and viper `WatchConfig` reloads the file at runtime. YAML keys are the flag names verbatim (`controller-endpoint`, `controller-tls-ca-path`, `agent-tls-cert-path`, `agent-tls-key-path`, `controller-tls-server-name`, `node-name`); each can also be overridden by an `HM_*` env var.
-- Behavior: **dials out** to the controller's public gRPC endpoint with mTLS, runs the `Control` stream (`Hello` + heartbeats), and serves controller-pushed `AgentRequest`s — today `images.list`, which opens a Docker client (`client.FromEnv`, lazy — it does not dial the daemon until a request runs) and returns the local image list as JSON. Broader Docker lifecycle (`DockerOp`/events), carrying tunnels, and the node_exporter sidecar on `127.0.0.1:9100` remain design goals (§7). Because the docker client is lazy and only `images.list` uses it, the systemd unit keeps `docker.service` as a soft (`Wants`) ordering dependency, not a hard requirement.
+- Form: a static Go binary (installed as `/usr/local/bin/hostlink`) running as a **systemd service**; the unit and an example config live in `deploy/` (`deploy/hostlink.service`, `deploy/hostlink.yaml`).
+- Configuration: the agent reads all settings from `/etc/humble-mun/hostlink.yaml` (the chassis registers viper `SetConfigName("hostlink")` + `AddConfigPath("/etc/humble-mun")`; the binary's `version.Name` is `hostlink`). The systemd unit passes **no** command-line flags so config edits need no `daemon-reload`, and viper `WatchConfig` reloads the file at runtime. YAML keys are the flag names verbatim (`controller-endpoint`, `controller-tls-ca-path`, `agent-tls-cert-path`, `agent-tls-key-path`, `controller-tls-server-name`, `node-name`); each can also be overridden by an `HM_*` env var.
+- Behavior: **dials out** to the controller's public gRPC endpoint with mTLS and runs the `Control` stream (`Hello` + heartbeats), **reconnecting in-process** with exponential backoff + jitter and HTTP/2 keepalive (a controller redeploy is ridden out without a process restart). It serves controller-pushed `AgentRequest`s: the Docker **images** methods — `images.list` / `images.pull` (streaming) / `images.remove`, via a lazy `client.FromEnv` Docker client — and the **filesystem** methods — `fs.stat` / `fs.list` / `fs.read` (chunked download) / `fs.write` (chunked upload) / `fs.mkdir` / `fs.remove` — over the configured `--data-dir` working directory, with every path resolved inside it (traversal rejected). Broader Docker lifecycle (`DockerOp`/events), carrying tunnels, and the node_exporter sidecar on `127.0.0.1:9100` remain design goals (§7). Because the docker client is lazy, the systemd unit keeps `docker.service` as a soft (`Wants`) ordering dependency, not a hard requirement.
 - Network: behind NAT; only needs outbound reachability to the controller.
 
 ---
@@ -283,8 +290,8 @@ relay(localTCP, frameStream):
 
 In dependency order (`[done]` / `[partial]` / `[todo]` reflect current status):
 
-1. `[done]` `AgentLink` proto + generated code; agent↔controller connection setup, `Hello`/`Heartbeat`. (Reconnection: the agent's lifecycle is resilient but full reconnect-with-backoff is still thin.)
-2. `[partial]` Command dispatch and execution. The **generic `AgentRequest`/`AgentResult` envelope** (with the streaming `AgentProgress`/`final` extension) and the Docker **images** methods — **`images.list`**, **`images.pull`** (streaming SSE progress), **`images.remove`** — with their REST endpoints and the controller dispatcher are done. `DockerOp` (run/stop/start/rm) execution and `DockerEvent` reporting are `[todo]`.
+1. `[done]` `AgentLink` proto + generated code; agent↔controller connection setup, `Hello`/`Heartbeat`, with **in-process reconnect** (exponential backoff + jitter) and HTTP/2 keepalive.
+2. `[partial]` Command dispatch and execution. The **generic `AgentRequest`/`AgentResult` envelope** (with the streaming `AgentProgress`/`final` extension and the `AgentRequestChunk` upload extension) is done, along with: the Docker **images** methods — **`images.list`**, **`images.pull`** (streaming SSE progress), **`images.remove`**; and the **filesystem** methods over `--data-dir` — **`fs.stat`**/**`fs.list`**, **`fs.read`** (chunked download), **`fs.write`** (chunked multipart upload, with `ControllerPeer.Upload` for the cross-pod hop), **`fs.mkdir`**, recursive **`fs.remove`** — all with their REST endpoints (`/api/v1/agents/<id>/files`) and the controller dispatcher. `DockerOp` (run/stop/start/rm) execution and `DockerEvent` reporting are `[todo]`.
 3. `[todo]` Metrics: node_exporter sidecar + agent local pull; controller `/metrics` concurrent fan-out + MetricFamily merge + `agent_up`.
 4. `[todo]` Port forwarding: integrate `openconfig/grpctunnel` (**verify half-close first**); `ExposeRule`/`OpenForward`; Frame relay (with half-close and backpressure). `Forward` is currently a stub.
 5. `[partial]` Multi-replica affinity. Done: the `agent:<id> → holding_pod` Redis map (write/CAD-delete/TTL-refresh; standalone/sentinel/cluster topologies) and the **cross-pod relay for API requests** (`ControllerPeer.Dispatch` unary + `ControllerPeer.DispatchStream` streaming, on a dedicated in-cluster mTLS listener, optional via `peer.enabled`, with reject-and-retry on a stale mapping). `[todo]`: the `port:<P>` map + atomic port-pool allocation, and the cross-pod **port-forward** two-hop relay.

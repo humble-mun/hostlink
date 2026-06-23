@@ -40,6 +40,14 @@ service ControllerPeer {
   // final=true and carries the terminal code/payload/error. Used for long-running
   // operations (e.g. "images.pull") that report progress before completing.
   rpc DispatchStream(DispatchRequest) returns (stream AgentResult);
+
+  // Upload relays a streaming controller->agent request body to the holding pod.
+  // The first UploadFrame carries the routing key and the opening AgentRequest
+  // (e.g. an "fs.write" open); subsequent frames carry the body bytes, the last
+  // marked with last=true. The holding pod drives the agent and returns the
+  // terminal AgentResult. A pod that no longer holds the agent rejects with
+  // FAILED_PRECONDITION so the caller re-resolves and retries.
+  rpc Upload(stream UploadFrame) returns (AgentResult);
 }
 
 // AgentEvent is the agent->controller direction of the Control stream.
@@ -72,11 +80,23 @@ message DockerEvent {
 // Command is the controller->agent direction of the Control stream.
 message Command {
   oneof cmd {
-    OpenForward  open_forward = 1; // tell the agent to open a Forward stream for a session
-    DockerOp     docker_op    = 2; // run/stop/start/pause/unpause/rm
-    ExposeRule   expose_rule  = 3; // add/remove a port-exposure rule
-    AgentRequest request      = 4; // generic API-driven request (containers/images/...)
+    OpenForward       open_forward = 1; // tell the agent to open a Forward stream for a session
+    DockerOp          docker_op    = 2; // run/stop/start/pause/unpause/rm
+    ExposeRule        expose_rule  = 3; // add/remove a port-exposure rule
+    AgentRequest      request      = 4; // generic API-driven request (containers/images/...)
+    AgentRequestChunk chunk        = 5; // body chunk for a streaming request (e.g. "fs.write")
   }
+}
+
+// AgentRequestChunk carries one chunk of a streaming request body for the
+// AgentRequest correlated by request_id. The controller sends the opening
+// AgentRequest first (method names the operation, payload its metadata), then a
+// sequence of chunks; last=true marks the final one. Used for large uploads so
+// the body never has to be buffered into a single message.
+message AgentRequestChunk {
+  string request_id = 1;
+  bytes  data = 2;
+  bool   last = 3;
 }
 
 // AgentRequest is the generic, method-dispatched request the controller drives
@@ -117,6 +137,18 @@ message AgentProgress {
 message DispatchRequest {
   string agent_id = 1;
   AgentRequest request = 2;
+}
+
+// UploadFrame is one message of the ControllerPeer.Upload client stream. The
+// first frame sets open (agent_id + the opening AgentRequest); every following
+// frame carries a body chunk, the last marked with last=true. It is the cross-pod
+// analogue of an AgentRequest followed by AgentRequestChunks on the Control stream.
+message UploadFrame {
+  oneof kind {
+    DispatchRequest open  = 1; // first frame: routing key + opening AgentRequest
+    bytes           chunk = 2; // subsequent frames: body bytes
+  }
+  bool last = 3; // marks the final chunk frame
 }
 
 // OpenForward instructs the agent to open a Forward stream for a pending public

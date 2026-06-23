@@ -163,8 +163,8 @@ sudo install -m 0644 debug/pki/agent/agent-demo/tls.crt /etc/humble-mun/agent/tl
 sudo install -m 0640 debug/pki/agent/agent-demo/tls.key /etc/humble-mun/agent/tls.key
 ```
 
-Then set the connection details in `/etc/humble-mun/agent.yaml` (see
-[`deploy/agent.yaml`](../deploy/agent.yaml) for the full template):
+Then set the connection details in `/etc/humble-mun/hostlink.yaml` (see
+[`deploy/hostlink.yaml`](../deploy/hostlink.yaml) for the full template):
 
 ```yaml
 controller-endpoint: hostlink-controller:8443   # host:port the agent dials

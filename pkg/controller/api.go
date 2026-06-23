@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"time"
@@ -14,6 +15,11 @@ import (
 	"github.com/humble-mun/hostlink/pkg/agentapi"
 	hostlinkv1 "github.com/humble-mun/hostlink/pkg/api/hostlink/v1"
 )
+
+// fsUploadChunkSize bounds each body chunk the controller streams to an agent on
+// an upload. It mirrors the agent-side read chunk size and stays well under the
+// gRPC max message size so uploads of any length need no raised limits.
+const fsUploadChunkSize = 64 * 1024
 
 // dispatchTimeout bounds how long a REST handler waits for an agent to answer a
 // dispatched request before returning a gateway timeout.
@@ -114,9 +120,9 @@ type pullDoneFrame struct {
 // ControllerPeer. It returns a channel of frames (progress frames then one
 // terminal frame) plus a cancel that the caller must invoke when it stops
 // reading. It returns errAgentNotConnected when no replica holds the agent.
-func (svc *service) dispatchStream(ctx context.Context, agentID, method string, payload []byte) (frames <-chan streamFrame, cancel func(), err error) {
+func (svc *service) dispatchStream(ctx context.Context, agentID, method string, payload []byte) (frames <-chan streamFrame, done <-chan struct{}, cancel func(), err error) {
 	if conn, ok := svc.registry.get(agentID); ok {
-		frames, cancel, err = conn.dispatchStream(ctx, method, payload)
+		frames, done, cancel, err = conn.dispatchStream(ctx, method, payload)
 		return
 	}
 
@@ -137,12 +143,105 @@ func (svc *service) dispatchStream(ctx context.Context, agentID, method string, 
 	// The peer relay is driven entirely by ctx; derive a cancelable child so the
 	// caller can tear the relay down the same way it would a local stream.
 	relayCtx, relayCancel := context.WithCancel(ctx)
-	if frames, err = svc.peers.dispatchStream(relayCtx, addr, agentID, method, payload); err != nil {
+	if frames, done, err = svc.peers.dispatchStream(relayCtx, addr, agentID, method, payload); err != nil {
 		relayCancel()
 		return
 	}
 	cancel = relayCancel
 	return
+}
+
+// dispatchUpload drives a streaming controller->agent upload to agentID. It
+// prefers the local Control stream and otherwise relays to the holding pod via
+// ControllerPeer.Upload. The opening AgentRequest (method/openPayload) is sent,
+// then body is streamed in chunks, and the agent's terminal AgentResult is
+// returned. It returns errAgentNotConnected when no replica holds the agent.
+func (svc *service) dispatchUpload(ctx context.Context, agentID, method string, openPayload []byte, body io.Reader) (result *hostlinkv1.AgentResult, err error) {
+	if conn, ok := svc.registry.get(agentID); ok {
+		var up *uploadDispatch
+		if up, err = conn.dispatchUpload(method, openPayload); err != nil {
+			return
+		}
+		if err = streamUploadBody(body, up.sendChunk); err != nil {
+			// The body read or a chunk send failed (e.g. client disconnected). The
+			// agent aborts the partial write on its idle timeout; surface the error.
+			return
+		}
+		result, err = up.await(ctx)
+		return
+	}
+
+	if svc.peers == nil {
+		err = errAgentNotConnected
+		return
+	}
+
+	var addr string
+	if addr, err = svc.registry.locate(ctx, agentID); err != nil {
+		return
+	}
+	if addr == "" || addr == svc.selfAddr {
+		err = errAgentNotConnected
+		return
+	}
+
+	result, err = svc.peers.upload(ctx, addr, agentID, method, openPayload, body)
+	return
+}
+
+// consumeStream drives a streaming dispatch to completion: it invokes onFrame for
+// each frame until one returns true (the terminal frame), the context ends, or
+// done closes (agent disconnect). On disconnect it first drains any already
+// delivered frames — a terminal frame among them still completes the stream — and
+// otherwise calls onAbort.
+func consumeStream(ctx context.Context, frames <-chan streamFrame, done <-chan struct{}, onFrame func(streamFrame) (finished bool), onAbort func()) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case frame := <-frames:
+			if onFrame(frame) {
+				return
+			}
+		case <-done:
+			for {
+				select {
+				case frame := <-frames:
+					if onFrame(frame) {
+						return
+					}
+				default:
+					onAbort()
+					return
+				}
+			}
+		}
+	}
+}
+
+// streamUploadBody reads body in fsUploadChunkSize pieces and delivers each via
+// send (last=false), then a terminal empty chunk (last=true) to mark completion.
+// send fully consumes each slice before returning (the underlying stream Send
+// marshals it synchronously), so the read buffer is safely reused.
+func streamUploadBody(body io.Reader, send func(data []byte, last bool) error) (err error) {
+	buf := make([]byte, fsUploadChunkSize)
+	for {
+		var n int
+		n, err = body.Read(buf)
+		if n > 0 {
+			if serr := send(buf[:n], false); serr != nil {
+				err = serr
+				return
+			}
+		}
+		if errors.Is(err, io.EOF) {
+			err = send(nil, true)
+			return
+		}
+		if err != nil {
+			return
+		}
+	}
 }
 
 // pullAgentImage handles POST /api/v1/agents/:agentId/images. The JSON body
@@ -170,7 +269,7 @@ func (svc *service) pullAgentImage(c *gin.Context) {
 		return
 	}
 
-	frames, cancel, err := svc.dispatchStream(c.Request.Context(), agentID, agentapi.MethodImagesPull, payload)
+	frames, done, cancel, err := svc.dispatchStream(c.Request.Context(), agentID, agentapi.MethodImagesPull, payload)
 	if err != nil {
 		logger.Error(err, "dispatch images.pull to agent failed")
 		switch {
@@ -197,31 +296,25 @@ func (svc *service) pullAgentImage(c *gin.Context) {
 	c.Writer.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
-	ctx := c.Request.Context()
-	for {
-		select {
-		case <-ctx.Done():
-			// Client disconnected; cancel() (deferred) tears down the pull.
-			return
-		case frame, open := <-frames:
-			if !open {
-				// Channel closed without a terminal frame: agent disconnected mid-pull.
-				writeSSEEvent(c.Writer, pullDoneFrame{Done: true, Error: "agent disconnected"})
-				flusher.Flush()
-				return
-			}
-			if frame.Final {
-				writeSSEEvent(c.Writer, pullDoneFrame{Done: true, Code: frame.Code, Error: frame.Error})
-				flusher.Flush()
-				return
-			}
-			if _, werr := writeSSERaw(c.Writer, frame.Payload); werr != nil {
-				logger.Error(werr, "write progress event failed; client gone")
-				return
-			}
+	// emit writes one frame as SSE and reports whether the stream is finished.
+	emit := func(frame streamFrame) (finished bool) {
+		if frame.Final {
+			writeSSEEvent(c.Writer, pullDoneFrame{Done: true, Code: frame.Code, Error: frame.Error})
 			flusher.Flush()
+			return true
 		}
+		if _, werr := writeSSERaw(c.Writer, frame.Payload); werr != nil {
+			logger.Error(werr, "write progress event failed; client gone")
+			return true
+		}
+		flusher.Flush()
+		return false
 	}
+
+	consumeStream(c.Request.Context(), frames, done, emit, func() {
+		writeSSEEvent(c.Writer, pullDoneFrame{Done: true, Error: "agent disconnected"})
+		flusher.Flush()
+	})
 }
 
 // writeSSEEvent marshals v and writes it as a single SSE data event.

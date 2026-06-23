@@ -127,5 +127,5 @@ Create the controller Secret the Helm chart consumes (key names matter):
 
 On each agent host, copy debug/pki/agent/<id>/{ca.crt,tls.crt,tls.key} to
 /etc/humble-mun/agent/ and set controller-endpoint + controller-tls-server-name (one of the
-controller SAN entries, e.g. hostlink-controller) in /etc/humble-mun/agent.yaml.
+controller SAN entries, e.g. hostlink-controller) in /etc/humble-mun/hostlink.yaml.
 EOF

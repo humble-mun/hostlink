@@ -17,8 +17,8 @@ func newRootCommand() *cobra.Command {
 	var init func() error
 	cmd := &cobra.Command{
 		Use:   version.Name,
-		Short: "hostlink-agent runs on an external host to execute commands, report metrics, and carry tunnels.",
-		Long: "hostlink-agent is the host-side component of hostlink. It runs as a systemd service on a Linux " +
+		Short: "The hostlink agent runs on an external host to execute commands, report metrics, and carry tunnels.",
+		Long: "The hostlink agent is the host-side component of hostlink. It runs as a systemd service on a Linux " +
 			"host outside the cloud (behind NAT), dials out to the hostlink-controller over a persistent gRPC " +
 			"connection, manages local Docker containers, reports node metrics, and carries reverse TCP " +
 			"tunnels for dynamic port forwarding.",

@@ -173,6 +173,7 @@ var AgentLink_ServiceDesc = grpc.ServiceDesc{
 const (
 	ControllerPeer_Dispatch_FullMethodName       = "/hostlink.v1.ControllerPeer/Dispatch"
 	ControllerPeer_DispatchStream_FullMethodName = "/hostlink.v1.ControllerPeer/DispatchStream"
+	ControllerPeer_Upload_FullMethodName         = "/hostlink.v1.ControllerPeer/Upload"
 )
 
 // ControllerPeerClient is the client API for ControllerPeer service.
@@ -197,6 +198,13 @@ type ControllerPeerClient interface {
 	// final=true and carries the terminal code/payload/error. Used for long-running
 	// operations (e.g. "images.pull") that report progress before completing.
 	DispatchStream(ctx context.Context, in *DispatchRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[AgentResult], error)
+	// Upload relays a streaming controller->agent request body to the holding pod.
+	// The first UploadFrame carries the routing key and the opening AgentRequest
+	// (e.g. an "fs.write" open); subsequent frames carry the body bytes, the last
+	// marked with last=true. The holding pod drives the agent and returns the
+	// terminal AgentResult. A pod that no longer holds the agent rejects with
+	// FAILED_PRECONDITION so the caller re-resolves and retries.
+	Upload(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[UploadFrame, AgentResult], error)
 }
 
 type controllerPeerClient struct {
@@ -236,6 +244,19 @@ func (c *controllerPeerClient) DispatchStream(ctx context.Context, in *DispatchR
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type ControllerPeer_DispatchStreamClient = grpc.ServerStreamingClient[AgentResult]
 
+func (c *controllerPeerClient) Upload(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[UploadFrame, AgentResult], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &ControllerPeer_ServiceDesc.Streams[1], ControllerPeer_Upload_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[UploadFrame, AgentResult]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type ControllerPeer_UploadClient = grpc.ClientStreamingClient[UploadFrame, AgentResult]
+
 // ControllerPeerServer is the server API for ControllerPeer service.
 // All implementations must embed UnimplementedControllerPeerServer
 // for forward compatibility.
@@ -258,6 +279,13 @@ type ControllerPeerServer interface {
 	// final=true and carries the terminal code/payload/error. Used for long-running
 	// operations (e.g. "images.pull") that report progress before completing.
 	DispatchStream(*DispatchRequest, grpc.ServerStreamingServer[AgentResult]) error
+	// Upload relays a streaming controller->agent request body to the holding pod.
+	// The first UploadFrame carries the routing key and the opening AgentRequest
+	// (e.g. an "fs.write" open); subsequent frames carry the body bytes, the last
+	// marked with last=true. The holding pod drives the agent and returns the
+	// terminal AgentResult. A pod that no longer holds the agent rejects with
+	// FAILED_PRECONDITION so the caller re-resolves and retries.
+	Upload(grpc.ClientStreamingServer[UploadFrame, AgentResult]) error
 	mustEmbedUnimplementedControllerPeerServer()
 }
 
@@ -273,6 +301,9 @@ func (UnimplementedControllerPeerServer) Dispatch(context.Context, *DispatchRequ
 }
 func (UnimplementedControllerPeerServer) DispatchStream(*DispatchRequest, grpc.ServerStreamingServer[AgentResult]) error {
 	return status.Error(codes.Unimplemented, "method DispatchStream not implemented")
+}
+func (UnimplementedControllerPeerServer) Upload(grpc.ClientStreamingServer[UploadFrame, AgentResult]) error {
+	return status.Error(codes.Unimplemented, "method Upload not implemented")
 }
 func (UnimplementedControllerPeerServer) mustEmbedUnimplementedControllerPeerServer() {}
 func (UnimplementedControllerPeerServer) testEmbeddedByValue()                        {}
@@ -324,6 +355,13 @@ func _ControllerPeer_DispatchStream_Handler(srv interface{}, stream grpc.ServerS
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type ControllerPeer_DispatchStreamServer = grpc.ServerStreamingServer[AgentResult]
 
+func _ControllerPeer_Upload_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(ControllerPeerServer).Upload(&grpc.GenericServerStream[UploadFrame, AgentResult]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type ControllerPeer_UploadServer = grpc.ClientStreamingServer[UploadFrame, AgentResult]
+
 // ControllerPeer_ServiceDesc is the grpc.ServiceDesc for ControllerPeer service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -341,6 +379,11 @@ var ControllerPeer_ServiceDesc = grpc.ServiceDesc{
 			StreamName:    "DispatchStream",
 			Handler:       _ControllerPeer_DispatchStream_Handler,
 			ServerStreams: true,
+		},
+		{
+			StreamName:    "Upload",
+			Handler:       _ControllerPeer_Upload_Handler,
+			ClientStreams: true,
 		},
 	},
 	Metadata: "hostlink/v1/hostlink.proto",

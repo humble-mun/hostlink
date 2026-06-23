@@ -26,6 +26,14 @@ func (a *agent) handleRequest(ctx context.Context, req *hostlinkv1.AgentRequest)
 		result.Payload, result.Code, result.Error = a.listImages(ctx)
 	case agentapi.MethodImagesRemove:
 		result.Payload, result.Code, result.Error = a.removeImages(ctx, req)
+	case agentapi.MethodFsStat:
+		result.Payload, result.Code, result.Error = a.statPath(req)
+	case agentapi.MethodFsList:
+		result.Payload, result.Code, result.Error = a.listDir(req)
+	case agentapi.MethodFsMkdir:
+		result.Code, result.Error = a.mkdir(req)
+	case agentapi.MethodFsRemove:
+		result.Code, result.Error = a.remove(req)
 	default:
 		result.Code = http.StatusNotImplemented
 		result.Error = "unknown method: " + req.GetMethod()

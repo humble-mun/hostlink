@@ -5,6 +5,8 @@
 // controller and the agent encode/decode against.
 package agentapi
 
+import "time"
+
 const (
 	// MethodImagesList lists the Docker images present on the agent host. It takes
 	// no request payload; the result payload is a JSON array of ImageSummary.
@@ -20,7 +22,74 @@ const (
 	// Its request payload is a RemoveRequest; the result payload is a
 	// RemoveResult reporting per-reference deletions and errors.
 	MethodImagesRemove = "images.remove"
+
+	// MethodFsStat reports metadata for a single path under the agent working
+	// directory. Its request payload is an FsPathRequest; the result payload is
+	// an FsEntry. A missing path yields code 404.
+	MethodFsStat = "fs.stat"
+
+	// MethodFsList lists the immediate (non-recursive) entries of a directory
+	// under the agent working directory. Its request payload is an FsPathRequest;
+	// the result payload is an FsListResult.
+	MethodFsList = "fs.list"
+
+	// MethodFsRead streams a file's bytes from the agent working directory. Its
+	// request payload is an FsPathRequest. It is a streaming method: the body is
+	// delivered as a sequence of AgentProgress frames (raw bytes, not JSON)
+	// followed by a terminal AgentResult. When the file cannot be opened (missing,
+	// or a directory) the agent emits no body frames and reports the error in the
+	// terminal result (code 404/400) so the REST layer can still set a status.
+	MethodFsRead = "fs.read"
+
+	// MethodFsWrite writes a file under the agent working directory. Its opening
+	// request payload is an FsWriteRequest; the body is delivered as a sequence of
+	// AgentRequestChunk messages on the Control stream. With Exclusive set, an
+	// existing target yields code 409; otherwise the file is truncated and
+	// overwritten. The terminal AgentResult reports the outcome.
+	MethodFsWrite = "fs.write"
+
+	// MethodFsMkdir creates a directory (and any missing parents) under the agent
+	// working directory. Its request payload is an FsPathRequest. An existing
+	// directory yields code 409.
+	MethodFsMkdir = "fs.mkdir"
+
+	// MethodFsRemove deletes a path under the agent working directory, recursively
+	// for directories. Its request payload is an FsPathRequest. A missing path
+	// yields code 404.
+	MethodFsRemove = "fs.remove"
 )
+
+// FsPathRequest is the request payload shared by the path-addressed fs methods
+// (stat, list, read, mkdir, remove). Path is relative to the agent working
+// directory; an empty Path addresses the working directory root.
+type FsPathRequest struct {
+	Path string `json:"path"`
+}
+
+// FsWriteRequest is the opening MethodFsWrite request payload. Path is the
+// target file relative to the agent working directory. Exclusive requires the
+// target not to exist (a failed create yields 409); when false the target is
+// truncated and overwritten.
+type FsWriteRequest struct {
+	Path      string `json:"path"`
+	Exclusive bool   `json:"exclusive,omitempty"`
+}
+
+// FsEntry is one directory entry (or a single path's metadata for stat). Dir
+// reports whether the entry is a directory; Size is the file size in bytes (0
+// for directories); ModTime is the last-modification time.
+type FsEntry struct {
+	Name    string    `json:"name"`
+	Dir     bool      `json:"dir"`
+	Size    int64     `json:"size"`
+	ModTime time.Time `json:"modTime"`
+}
+
+// FsListResult is the MethodFsList result payload: the immediate entries of the
+// listed directory, not recursed.
+type FsListResult struct {
+	Entries []FsEntry `json:"entries"`
+}
 
 // ImageSummary is one entry of the MethodImagesList result. It mirrors the
 // relevant fields of the Docker image summary, projected to a stable JSON shape

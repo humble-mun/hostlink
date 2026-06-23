@@ -1,4 +1,8 @@
-# hostlink-agent systemd unit
+# hostlink (agent) systemd unit
+#
+# The agent is the only hostlink component that runs under systemd; the controller
+# runs in the cloud as a Kubernetes StatefulSet. So both the unit and the binary
+# are named simply 'hostlink' (not 'hostlink-agent').
 #
 # The agent is a single static Go binary that runs on each external Linux host
 # (on-prem / colo, behind NAT). It dials OUTBOUND to the cloud-side
@@ -7,25 +11,28 @@
 # carry command, metrics and port-forward traffic over that one connection.
 #
 # Install:
-#   1. Copy the binary to /usr/local/bin/hostlink-agent
-#        go build -mod=vendor -o bin/hostlink-agent ./cmd/agent   # (cross-compiled for the host)
-#        install -m 0755 bin/hostlink-agent /usr/local/bin/hostlink-agent
+#   1. Copy the binary to /usr/local/bin/hostlink
+#        go build -mod=vendor -o bin/hostlink ./cmd/agent   # (cross-compiled for the host)
+#        install -m 0755 bin/hostlink /usr/local/bin/hostlink
 #   2. Drop the agent's mTLS material under /etc/humble-mun/agent/ :
 #        tls.crt  - client certificate the agent presents to the controller
 #        tls.key  - matching private key (keep mode 0640, owned by the agent user)
 #        ca.crt   - CA bundle used to verify the controller's server certificate
-#   3. Write the agent configuration to /etc/humble-mun/agent.yaml (see the
-#      companion agent.yaml in this directory for a documented example).
-#   4. systemctl daemon-reload && systemctl enable --now hostlink-agent
+#   3. Write the agent configuration to /etc/humble-mun/hostlink.yaml (see the
+#      companion hostlink.yaml in this directory for a documented example).
+#   4. systemctl daemon-reload && systemctl enable --now hostlink
+#
+#   The fs API working directory (/var/lib/hostlink by default) is provisioned by
+#   StateDirectory below — do NOT create or chown it by hand (see that section).
 #
 # Configuration model:
-#   The agent reads ALL of its settings from /etc/humble-mun/agent.yaml. The
-#   chassis wires viper to SetConfigName("agent") + AddConfigPath("/etc/humble-mun")
-#   (the binary's name is 'agent', set via -ldflags version.Name at build time),
-#   so the file path is fixed at /etc/humble-mun/agent.yaml. The YAML keys are the
+#   The agent reads ALL of its settings from /etc/humble-mun/hostlink.yaml. The
+#   chassis wires viper to SetConfigName("hostlink") + AddConfigPath("/etc/humble-mun")
+#   (the binary's name is 'hostlink', set via -ldflags version.Name at build time),
+#   so the file path is fixed at /etc/humble-mun/hostlink.yaml. The YAML keys are the
 #   flag names verbatim (controller-endpoint, controller-tls-ca-path, agent-tls-cert-path, ...).
 #
-#   Because the chassis also calls viper.WatchConfig(), edits to agent.yaml are
+#   Because the chassis also calls viper.WatchConfig(), edits to hostlink.yaml are
 #   picked up at runtime WITHOUT `systemctl daemon-reload` and without editing the
 #   unit. This is exactly why ExecStart passes NO command-line flags: the running
 #   configuration lives entirely in the config file, not in the unit.
@@ -51,12 +58,12 @@ StartLimitBurst=5
 [Service]
 Type=simple
 
-# All configuration is read from /etc/humble-mun/agent.yaml (see header). The
+# All configuration is read from /etc/humble-mun/hostlink.yaml (see header). The
 # agent self-discovers that file via the chassis viper setup, so ExecStart passes
-# NO flags: editing agent.yaml is enough, no unit edit or daemon-reload required.
-# (--controller-endpoint is mandatory; if it is absent from agent.yaml the agent
+# NO flags: editing hostlink.yaml is enough, no unit edit or daemon-reload required.
+# (--controller-endpoint is mandatory; if it is absent from hostlink.yaml the agent
 # exits immediately, and the Restart policy below will keep retrying.)
-ExecStart=/usr/local/bin/hostlink-agent
+ExecStart=/usr/local/bin/hostlink
 
 # The chassis embeds a Gin HTTP server. Run it in release mode so it does not
 # log the noisy debug-mode startup banner and skips Gin's debug instrumentation.
@@ -78,6 +85,21 @@ RestartSec=5s
 User=hostlink
 Group=hostlink
 
+# Provision the fs API working directory (data-dir in hostlink.yaml, default
+# /var/lib/hostlink). This single line is what makes that directory usable:
+#   - ProtectSystem=strict below mounts the whole filesystem (including /var/lib)
+#     READ-ONLY. StateDirectory= is what carves /var/lib/hostlink back out as
+#     writable; without it, mkdir/upload through the fs API fails with
+#     "read-only file system" even though the path exists and is owned correctly.
+#   - systemd CREATES /var/lib/hostlink (mode 0750) and chowns it to User= below
+#     before ExecStart, and the binary requires data-dir to already exist.
+# So do NOT `mkdir`/`chown` /var/lib/hostlink by hand — let StateDirectory own it.
+# A manually-created directory is NOT automatically writable under ProtectSystem=
+# strict; if you must point data-dir elsewhere, add that path to ReadWritePaths=
+# (and keep data-dir = /var/lib/<StateDirectory> to use this line as-is).
+StateDirectory=hostlink
+StateDirectoryMode=0750
+
 # Sandboxing. These are conservative defaults appropriate for an outbound-only
 # network client with no local listeners that matter off-host.
 NoNewPrivileges=yes
@@ -96,7 +118,7 @@ LockPersonality=yes
 # 127.0.0.1:9100) only needs IPv4/IPv6 stream sockets.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 # Log to the journal under this identifier.
-SyslogIdentifier=hostlink-agent
+SyslogIdentifier=hostlink
 
 [Install]
 WantedBy=multi-user.target
