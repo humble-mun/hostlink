@@ -8,7 +8,6 @@ import (
 	"google.golang.org/grpc/keepalive"
 
 	"github.com/humble-mun/chassis/pkg/app"
-	"github.com/humble-mun/chassis/pkg/metrics"
 	"github.com/humble-mun/chassis/pkg/version"
 
 	"github.com/humble-mun/hostlink/pkg/controller"
@@ -31,6 +30,12 @@ func newRootCommand() *cobra.Command {
 		},
 		SilenceUsage: true,
 		RunE: func(_ *cobra.Command, _ []string) (err error) {
+			// Initialize viper (config file + env + flag binding) before building the
+			// gRPC server so server options can read configured values; BaseContext is
+			// then called without WithInit since init has already run.
+			if err = init(); err != nil {
+				return
+			}
 			// Accept the agent's keepalive pings: MinTime must be <= the agent's
 			// keepalive Time and PermitWithoutStream must match its client setting,
 			// otherwise the server answers a too-frequent ping with GOAWAY
@@ -40,10 +45,10 @@ func newRootCommand() *cobra.Command {
 					MinTime:             10 * time.Second,
 					PermitWithoutStream: true,
 				}),
+				grpc.MaxRecvMsgSize(controller.GRPCMaxRecvMsgSize()),
 			)
 			var base app.Base
 			if base, err = app.BaseContext(
-				app.WithInit(init),
 				app.WithGRPCServer(srv),
 				app.WithTCPListener(controller.ListenerOptions()...),
 			); err != nil {
@@ -62,7 +67,6 @@ func newRootCommand() *cobra.Command {
 			}()
 
 			base.HTTPGin.RegisterRoute(svc.RegisterRoute)
-			metrics.RegisterScrapeHook(svc.RegisterScrapeHook)
 
 			base.Logger.Info("controller started")
 			defer base.Logger.Info("controller finished")

@@ -52,8 +52,38 @@ node-name: ""
 # --------------------------------------------------------------------------
 
 # Directory whose contents the controller can browse, download, upload, and
-# delete through the fs API (GET/POST/PUT/DELETE /api/v1/agents/<id>/fs). Leave
+# delete through the fs API (GET/POST/PUT/DELETE /api/v1/agents/<id>/files). Leave
 # empty to disable the fs API. The directory must already exist and be writable
 # by the agent user; the systemd unit provisions /var/lib/hostlink for this via
 # StateDirectory before the agent starts.
 data-dir: "/var/lib/hostlink"
+
+# --------------------------------------------------------------------------
+# Metrics scrape targets (upstream exporters)
+# --------------------------------------------------------------------------
+
+# Upstream exporters the agent pulls when the controller fans out a scrape. The
+# controller aggregates every agent's targets behind its own GET /api/v1/metrics
+# endpoint, injecting an `agent=<node-name>` label and an `exporter=<name>` label
+# into every series (see the controller-side metrics endpoint). Leave the list
+# empty (or omit it) to disable the feature.
+#
+# Each entry is a name + an exporter url. `name` becomes the `exporter` label, so
+# keep it short and stable (e.g. node, dcgm, cadvisor). The url scheme selects the
+# transport:
+#   - http/https — a TCP endpoint (typically a 127.0.0.1 sidecar). The path
+#     defaults to /metrics when omitted (http://127.0.0.1:9100 == .../metrics).
+#   - unix       — a unix domain socket; the url path IS the socket path
+#     (unix:///var/run/foo/server.sock, three slashes). The HTTP request path
+#     defaults to /metrics; set `path` to override it.
+# The agent GETs each target locally with a short per-target timeout and streams
+# the raw exposition back over the existing connection.
+scrape-targets:
+- name: node
+  url: http://127.0.0.1:9100
+- name: dcgm
+  url: http://127.0.0.1:9400
+# Example unix-socket exporter (uncomment and adjust):
+# - name: cadvisor
+#   url: unix:///var/run/cadvisor/server.sock
+#   path: /metrics

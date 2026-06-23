@@ -9,10 +9,11 @@
 #     templates/controller.yaml).
 #   - http: in-cluster plaintext default listener (metrics/probe/version/
 #     logging). Never exposed through the ingress; kept here so Prometheus and
-#     in-cluster clients reach /metrics via this ClusterIP. The metrics fan-out
-#     is stateless -- any replica answers /metrics by aggregating the agents it
-#     currently holds -- so a normal load-balanced ClusterIP is sufficient and
-#     no headless/per-pod addressing is required.
+#     in-cluster clients reach /metrics (controller self) and /api/v1/metrics
+#     (the aggregated agent-exporter fan-out) via this ClusterIP. The fan-out is
+#     stateless -- any replica answers /api/v1/metrics by aggregating the online
+#     fleet -- so a normal load-balanced ClusterIP is sufficient and no
+#     headless/per-pod addressing is required.
 # ---------------------------------------------------------------------------
 apiVersion: v1
 kind: Service
@@ -42,7 +43,7 @@ spec:
 # dials it directly here. clusterIP: None so DNS returns the individual pod A
 # records rather than a single virtual IP (no load balancing -- we target a
 # specific pod). The load-balanced ClusterIP above stays for agent gRPC and the
-# stateless metrics fan-out; this headless one is for pod-to-pod addressing.
+# stateless /api/v1/metrics fan-out; this headless one is for pod-to-pod addressing.
 # ---------------------------------------------------------------------------
 apiVersion: v1
 kind: Service

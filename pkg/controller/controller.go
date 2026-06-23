@@ -1,7 +1,6 @@
 package controller
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -17,10 +16,9 @@ import (
 )
 
 // Service is the controller's lifecycle surface: it registers the HTTP routes and
-// the metrics scrape hook, and releases its resources (peer plane, redis) on Close.
+// releases its resources (peer plane, redis) on Close.
 type Service interface {
 	io.Closer
-	RegisterScrapeHook(context.Context)
 	RegisterRoute(*gin.Engine)
 }
 
@@ -109,11 +107,10 @@ func (svc *service) startPeerPlane(logger logr.Logger, reg *registry) (err error
 	return
 }
 
-func (svc *service) RegisterScrapeHook(context.Context) {}
-
 func (svc *service) RegisterRoute(mux *gin.Engine) {
 	group := mux.Group("/api/v1")
 	group.GET("/agents", svc.listAgents)
+	group.GET("/metrics", svc.agentMetrics)
 	group.GET("/agents/:agentId/images", svc.listAgentImages)
 	group.POST("/agents/:agentId/images", svc.pullAgentImage)
 	group.DELETE("/agents/:agentId/images", svc.removeAgentImages)

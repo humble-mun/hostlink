@@ -57,7 +57,28 @@ const (
 	// for directories. Its request payload is an FsPathRequest. A missing path
 	// yields code 404.
 	MethodFsRemove = "fs.remove"
+
+	// MethodMetricsScrape pulls the agent's configured upstream exporters (e.g.
+	// node_exporter, dcgm-exporter) and streams their raw Prometheus exposition to
+	// the controller. It takes no request payload. It is a streaming method: each
+	// exporter's body is delivered as a sequence of AgentProgress frames carrying a
+	// MetricsFrame, and the terminal AgentResult marks the whole scrape complete.
+	// Streaming keeps the agent's memory bounded and removes the single-message
+	// size limit a unary reply would impose on a large exposition.
+	MethodMetricsScrape = "metrics.scrape"
 )
+
+// MetricsFrame is one AgentProgress frame of a streaming metrics.scrape. Frames
+// for a given Exporter arrive in order: zero or more carrying a Chunk of its raw
+// exposition, then exactly one with Done set (Error non-empty when that exporter
+// could not be scraped). The controller demultiplexes by Exporter, reassembles
+// each body, and folds it into the fleet aggregation.
+type MetricsFrame struct {
+	Exporter string `json:"exporter"`
+	Chunk    []byte `json:"chunk,omitempty"`
+	Done     bool   `json:"done,omitempty"`
+	Error    string `json:"error,omitempty"`
+}
 
 // FsPathRequest is the request payload shared by the path-addressed fs methods
 // (stat, list, read, mkdir, remove). Path is relative to the agent working

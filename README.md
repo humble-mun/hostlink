@@ -10,11 +10,13 @@
 > remove) and an agent **working-directory filesystem** (`GET`/`POST`/`PUT`/`DELETE
 > /api/v1/agents/<id>/files` — browse, download, streamed multipart upload, and
 > recursive delete), served by an agent-side Docker client and a sandboxed data
-> directory; the Redis-backed `agent→pod` registry; and cross-pod API relay via the
-> `ControllerPeer` plane (multi-replica HA). Still **designed but not yet
-> implemented**: container *lifecycle* ops (`DockerOp`/events), metrics fan-out,
-> port forwarding, and the cross-pod port-forward data plane — see
-> [Roadmap](#roadmap). Do not deploy this as a control plane for real workloads yet.
+> directory; a **metrics aggregation** endpoint (`GET /api/v1/metrics`) that
+> streams and merges each agent's configured exporters; the Redis-backed
+> `agent→pod` registry; and cross-pod API relay via the `ControllerPeer` plane
+> (multi-replica HA). Still **designed but not yet implemented**: container
+> *lifecycle* ops (`DockerOp`/events), port forwarding, and the cross-pod
+> port-forward data plane — see [Roadmap](#roadmap). Do not deploy this as a
+> control plane for real workloads yet.
 
 A control plane for managing Linux hosts that live **outside the cloud** (on-prem / colo servers). These hosts are **not** Kubernetes nodes; their workloads run as **Docker containers**, not pods. `hostlink` gives the cloud a persistent, mutually-authenticated channel to each NAT'd host for command dispatch, container lifecycle, metrics, and raw-TCP port forwarding — with no inbound connectivity required to the host.
 
@@ -86,7 +88,7 @@ external host (behind NAT)                cloud (Kubernetes)
 
 One TCP connection, many HTTP/2 streams. The agent opens the `Control` stream once after connecting; the controller pushes commands down its response direction. Each forwarded public connection gets its own `Forward` stream so gRPC's per-stream flow control gives natural backpressure.
 
-> **What is implemented today:** the mTLS dial, the `Control` stream and `Hello` / `Heartbeat` exchange; the generic `AgentRequest`/`AgentResult` dispatch envelope with the Docker **images** endpoints — `GET` (list), `POST` (pull, streaming SSE progress), and `DELETE` (remove) on `/api/v1/agents/<id>/images`; the Redis `agent→pod` registry; and cross-pod relay of API requests via `ControllerPeer.Dispatch` (unary) and `ControllerPeer.DispatchStream` (streaming, for the pull progress). `Forward`, `DockerOp` execution, metrics fan-out, and the cross-pod port-forward data plane are stubs or unimplemented. See [Roadmap](#roadmap).
+> **What is implemented today:** the mTLS dial, the `Control` stream and `Hello` / `Heartbeat` exchange; the generic `AgentRequest`/`AgentResult` dispatch envelope with the Docker **images** endpoints — `GET` (list), `POST` (pull, streaming SSE progress), and `DELETE` (remove) on `/api/v1/agents/<id>/images`; the agent **working-directory filesystem** API (`GET`/`POST`/`PUT`/`DELETE /api/v1/agents/<id>/files`); the **metrics aggregation** endpoint (`GET /api/v1/metrics`) that reverse-pulls, labels, and merges each agent's configured exporters; the Redis `agent→pod` registry; and cross-pod relay of API requests via `ControllerPeer.Dispatch` (unary), `ControllerPeer.DispatchStream` (streaming), and `ControllerPeer.Upload` (client-streaming, for filesystem writes). `Forward`, `DockerOp` execution, and the cross-pod port-forward data plane are stubs or unimplemented. See [Roadmap](#roadmap).
 
 ---
 
@@ -108,18 +110,24 @@ The agent is the gRPC **client**; the controller has the public entrypoint and i
 
 On connect, the agent opens `Control(stream AgentEvent) returns (stream Command)`. The controller pushes `OpenForward`, `DockerOp` (run / stop / start / pause / unpause / rm), and `ExposeRule` down the `Command` stream. The agent reports its handshake, heartbeats, and Docker events up the `AgentEvent` stream.
 
-### Metrics Reverse Fan-out
+### Metrics: two endpoints, two concerns
 
-Prometheus stays in **pull mode** and scrapes a **single** target — the controller's `/metrics`. On scrape, the controller's handler:
+Prometheus stays in **pull mode**. The controller exposes **two** distinct endpoints (the in-cluster plaintext listener serves both):
 
-1. **Concurrently** reverse-pulls each online agent's node_exporter exposition over its existing connection.
-2. Gives each agent an **independent deadline strictly shorter than `scrape_timeout`** (~5s vs the 10s default); slow / failed agents are skipped so one slow agent does not blow up the whole scrape.
-3. **Merges by `MetricFamily`** — decode each exposition with `expfmt.TextParser`, inject an `agent=<id>` label into every series, merge by metric name into one family (one HELP/TYPE), then encode once.
-4. Synthesizes `agent_up{agent="<id>"}` (1 = scraped this round, 0 = offline) — the only clean signal for "an agent went down", since Prometheus sees only one target.
+- **`/metrics`** (chassis-owned) — the controller's **own** process metrics.
+- **`GET /api/v1/metrics`** — the **cloud-side aggregation of every agent's upstream exporters**. This is the reverse fan-out.
+
+On a scrape of `/api/v1/metrics`, the controller:
+
+1. enumerates the online fleet (the Redis `agent→pod` directory; in-memory mode = locally-held agents) and, with **bounded concurrency**, dispatches a streaming `metrics.scrape` to each agent — over its local `Control` stream, or relayed to the holding pod via `ControllerPeer.DispatchStream`;
+2. each agent pulls its configured `scrape-targets` (node_exporter, dcgm-exporter, …) locally and **streams** each exposition back in chunks, so agent memory stays bounded and no single-message size limit applies;
+3. gives each agent an **independent deadline shorter than `scrape_timeout`** (`--agent-scrape-timeout`, default 5s vs the 10s default); a slow / offline agent is skipped and contributes only `agent_up 0`;
+4. **merges by `MetricFamily`** — parse each exposition with `expfmt.TextParser`, inject `agent=<id>` + `exporter=<name>` labels into every series, fold series sharing a metric name under one family (one HELP/TYPE), then encode once;
+5. synthesizes `agent_up{agent="<id>"}` (1 = the stream completed this round, 0 = offline / timed out) and `hostlink_scrape_target_up{agent,exporter}` (per-exporter health). `agent_up` is the only clean "an agent went down" signal, since Prometheus' native `up` only reflects the controller endpoint.
 
 > **Constraint:** **never string-concatenate expositions.** Duplicate HELP/TYPE lines for the same metric name make the Prometheus parser reject the entire payload. Merge at the `MetricFamily` level.
 
-> node_exporter runs as a **separate sidecar binary**; the agent GETs `127.0.0.1:9100` locally. Do **not** import node_exporter as a library — its collector package is not a stable public API.
+> The `exporter` label (not `job` / `instance`) is used deliberately so the injected labels survive **without** requiring `honor_labels` in the Prometheus scrape config. Exporters run as **separate sidecar binaries**; the agent GETs them locally (e.g. `127.0.0.1:9100`). Do **not** import node_exporter as a library — its collector package is not a stable public API.
 
 ### Port Forwarding
 
@@ -316,13 +324,28 @@ The controller also inherits the chassis HTTP server flags (`--http-bind-address
 - **Form:** a Kubernetes **StatefulSet** (chart default `replicaCount: 1`). The chart at `charts/hostlink/` (`helm install <release> charts/hostlink`) renders a ConfigMap holding `/etc/humble-mun/controller.yaml`, the StatefulSet, a load-balanced ClusterIP Service (gRPC + in-cluster HTTP ports), a **headless `<release>-peer` Service** for stable per-pod DNS, and — when `ingress.host` is set — the agent-facing gRPC Ingress. **For HA, set `replicaCount > 1`, which requires `redis.url` + `peer.enabled`** (the chart fails the install otherwise — a half-configured multi-replica controller would silently 404 for agents held by sibling pods).
 - **Three listeners** (the chassis HTTP/2 server multiplexes gRPC and Gin onto each listener — `Content-Type: application/grpc` with HTTP/2 routes to the gRPC server, everything else to Gin):
   1. an **mTLS gRPC listener** (`--grpc-bind-address` + `WithTLSCert` + `WithMTLS`) that agents dial out to; exposed externally through the ingress.
-  2. a **plaintext (h2c) default listener**, bound in-cluster only, serving the REST API (`/api/v1/...`), `/metrics`, `/probe`, `/version`, `/logging`.
+  2. a **plaintext (h2c) default listener**, bound in-cluster only, serving the REST API (`/api/v1/...`, including the aggregated agent metrics at `/api/v1/metrics`), the controller's own `/metrics`, `/probe`, `/version`, `/logging`.
   3. (when `peer.enabled`) an **in-cluster ControllerPeer mTLS listener** on its own `grpc.Server` — separate from the shared chassis server so the relay plane is never reachable from the agent-facing/ingress listener.
 - **Ingress (L4 LoadBalancer):** the mTLS gRPC port for agent dial-out. Because the controller terminates mTLS itself, the Ingress MUST do L4/TLS **passthrough** (asserted explicitly via controller-specific annotations) — terminating TLS would strip the agent client certificate and break the identity model. A **reserved TCP port range** (e.g. `1025–2025`) for tunnel exposure is design-only and the chart does not open it yet.
 - **Dependencies:** **Redis** backs the `agent→pod` registry (optional single-replica, required for HA); the cross-pod relay of API requests rides the ControllerPeer plane. The `port:<P>` map + port allocation and the cross-pod port-forward data plane are still design-only.
 - **Certificates:** per plane, from a mounted Secret (`grpc.tlsSecretName` / `peer.tlsSecretName`) or, with `certManager.enabled`, issued per-pod by the **cert-manager CSI driver** from a configured `Issuer`/`ClusterIssuer` (`certManager.issuerKind` / `issuerName`).
 
 > **Bypass note.** The chassis server applies the same handler to every listener, so the plaintext default listener would also accept gRPC. The split relies on **network-layer isolation** — the default listener is reachable only inside the cluster, while agent gRPC is exposed solely through the mTLS listener via the ingress.
+
+#### Scraping the metrics
+
+The controller exposes **two** scrape paths on the in-cluster HTTP Service (`http` port): `/metrics` (the controller's own process metrics) and `/api/v1/metrics` (the aggregated agent-exporter fan-out, §4.3). The chart does **not** ship a scrape config — wire it to your monitoring stack the way that stack expects, pointing at the `http` Service port. Examples:
+
+- **Prometheus annotation-based discovery** (one target per path):
+  ```yaml
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8080"
+  prometheus.io/path: "/api/v1/metrics"   # add a second scrape for /metrics
+  ```
+- **Prometheus Operator `ServiceMonitor`** — two `endpoints` on the `http` port, `path: /metrics` and `path: /api/v1/metrics`.
+- **VictoriaMetrics `VMServiceScrape`** — same shape: two `endpoints` (or a `VMPodScrape`) targeting the `http` port and the two paths.
+
+Keep the Prometheus job's `scrape_timeout` **above** the controller's `--agent-scrape-timeout` (default 5s) so the fan-out's per-agent deadline fires first. The `/api/v1/metrics` series already carry `agent`/`exporter` labels, so `honor_labels` is not required.
 
 ### hostlink (external host)
 
@@ -379,11 +402,11 @@ Items below are **non-negotiable** — do not deviate during implementation.
 - [x] Agent **working-directory filesystem** endpoints on `/api/v1/agents/<id>/files`: browse/`fs.stat`+`fs.list`, chunked `fs.read` download, multipart chunked `fs.write` upload (exclusive create + `PUT` overwrite), `fs.mkdir`, recursive `fs.remove`; bounded-memory streaming both directions (`AgentRequestChunk` + cross-pod `ControllerPeer.Upload` relay) with a `--data-dir` working dir and path-traversal guard
 - [x] Redis `agent→pod` registry (write/CAD-delete/TTL-refresh; standalone/sentinel/cluster topologies) and cross-pod relay of API requests via `ControllerPeer.Dispatch` + `ControllerPeer.DispatchStream`, with reject-and-retry on a stale mapping
 - [x] Helm chart: StatefulSet + headless peer Service; optional Redis, peer plane, and cert-manager CSI cert issuance; multi-replica config guard
+- [x] Metrics aggregation: agent `scrape-targets` (node_exporter / dcgm / …) pulled on demand and **streamed** back; controller `GET /api/v1/metrics` bounded-concurrency reverse fan-out + `agent`/`exporter` label injection + `MetricFamily` merge + synthesized `agent_up` / `hostlink_scrape_target_up`, cross-pod aware via `ControllerPeer.DispatchStream`
 
 ### In Progress / Planned (MVP)
 
 - [ ] Container lifecycle ops: `DockerOp` (run/stop/start/rm) execution; `DockerEvent` reporting
-- [ ] Metrics: node_exporter sidecar + agent local pull; controller `/metrics` concurrent fan-out + `MetricFamily` merge + `agent_up`
 - [ ] Port forwarding: integrate `openconfig/grpctunnel` (verify half-close first); `ExposeRule` / `OpenForward`; `Frame` relay with half-close + backpressure (`Forward` is currently a stub)
 - [ ] Multi-replica **port forwarding**: the `port:<P>` map + atomic port-pool allocation, and the cross-pod two-hop relay of the port-forward data plane (the API-request relay already exists)
 - [ ] Lifecycle coupling: Docker events drive exposure establish / suspend / re-establish

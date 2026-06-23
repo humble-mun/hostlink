@@ -133,10 +133,14 @@ certManager:
 # ---------------------------------------------------------------------------
 # The chassis HTTP/2 server multiplexes gRPC and Gin onto every listener. This
 # default listener is left PLAINTEXT (h2c) on purpose and must stay reachable
-# only inside the cluster: it serves /metrics (Prometheus), /probe, /version and
-# /logging. Because the shared chassis handler would also accept gRPC here, the
-# agent/data split relies on network-layer isolation -- this listener is never
-# exposed through the ingress.
+# only inside the cluster: it serves /metrics (controller self-metrics) and
+# /api/v1/metrics (the aggregated agent-exporter fan-out) for Prometheus, plus
+# /probe, /version and /logging. The chart ships no scrape config -- point your
+# Prometheus/VictoriaMetrics scrape (annotation, ServiceMonitor, or VMServiceScrape)
+# at this http port and both paths; see the README "Scraping the metrics" note.
+# Because the shared chassis handler would also accept gRPC here, the agent/data
+# split relies on network-layer isolation -- this listener is never exposed
+# through the ingress.
 http:
   # bindAddress maps to --http-bind-address. Kept plaintext (no TLS cert/key)
   # so K8s probes and Prometheus can reach it over h2c in-cluster.

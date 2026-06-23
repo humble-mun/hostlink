@@ -6,9 +6,9 @@
 > 的 mTLS 连接与 `Control` 流（握手 + 心跳）；通用的请求/响应分发信封及两个 REST 接口族
 > —— **Docker 镜像**（`GET`/`POST`/`DELETE /api/v1/agents/<id>/images`：列举、SSE 流式
 > 拉取、删除）与 agent **工作目录文件系统**（`GET`/`POST`/`PUT`/`DELETE
-> /api/v1/agents/<id>/files`：浏览、下载、流式 multipart 上传、递归删除）；基于 Redis 的 `agent→pod`
+> /api/v1/agents/<id>/files`：浏览、下载、流式 multipart 上传、递归删除）；一个**指标聚合**端点（`GET /api/v1/metrics`，流式拉取并合并各 agent 配置的 exporter）；基于 Redis 的 `agent→pod`
 > 注册表；以及经 `ControllerPeer` 平面（`Dispatch` 一元 + `DispatchStream` 流式）的跨 pod API
-> （`DockerOp`/事件）、指标聚合、端口转发，以及跨 pod 的端口转发数据面 ——
+> （`DockerOp`/事件）、端口转发，以及跨 pod 的端口转发数据面 ——
 > 参见 [路线图](#路线图)。请勿将其作为承载真实业务的控制面部署。
 
 一个用于管理**云外**（自建机房 / 托管机房服务器）Linux 主机的控制面。这些主机**不是** Kubernetes 节点；其上的工作负载以 **Docker 容器**形式运行，而非 Pod。`hostlink` 为云端提供一条到每台 NAT 后主机的持久、双向认证通道，用于命令下发、容器生命周期管理、指标采集以及裸 TCP 端口转发 —— 且无需主机具备任何入站连通性。
@@ -81,7 +81,7 @@
 
 一条 TCP 连接，多条 HTTP/2 stream。agent 在连接后开启一次 `Control` 流；controller 沿其响应方向推送命令。每条被转发的公网连接拥有自己独立的 `Forward` 流，从而借助 gRPC 的每流级流控获得天然的背压（backpressure）。
 
-> **当前已实现的部分：** mTLS 拨号、`Control` 流与 `Hello` / `Heartbeat` 交互；通用的 `AgentRequest`/`AgentResult` 分发信封（含 `AgentProgress` / `final` 流式扩展）及 Docker 镜像 REST 接口（`GET` 列举 `images.list`、`POST` 经 SSE 流式拉取 `images.pull`、`DELETE` 删除 `images.remove`，位于 `/api/v1/agents/<id>/images`）；Redis 的 `agent→pod` 注册表；以及经 `ControllerPeer.Dispatch`（一元）与 `ControllerPeer.DispatchStream`（流式）的跨 pod API 请求中继。`Forward`、`DockerOp` 执行、指标聚合，以及跨 pod 的端口转发数据面仍为占位桩或尚未实现。参见[路线图](#路线图)。
+> **当前已实现的部分：** mTLS 拨号、`Control` 流与 `Hello` / `Heartbeat` 交互；通用的 `AgentRequest`/`AgentResult` 分发信封（含 `AgentProgress` / `final` 流式扩展）及 Docker 镜像 REST 接口（`GET` 列举 `images.list`、`POST` 经 SSE 流式拉取 `images.pull`、`DELETE` 删除 `images.remove`，位于 `/api/v1/agents/<id>/images`）；agent **工作目录文件系统**接口（`GET`/`POST`/`PUT`/`DELETE /api/v1/agents/<id>/files`）；**指标聚合**端点（`GET /api/v1/metrics`，反向拉取、打标并合并每个 agent 配置的 exporter）；Redis 的 `agent→pod` 注册表；以及经 `ControllerPeer.Dispatch`（一元）、`ControllerPeer.DispatchStream`（流式）与 `ControllerPeer.Upload`（客户端流式，用于文件系统写入）的跨 pod API 请求中继。`Forward`、`DockerOp` 执行，以及跨 pod 的端口转发数据面仍为占位桩或尚未实现。参见[路线图](#路线图)。
 
 ---
 
@@ -103,18 +103,24 @@ agent 是 gRPC **客户端**；controller 拥有公网入口、是 gRPC **服务
 
 连接建立后，agent 开启 `Control(stream AgentEvent) returns (stream Command)`。controller 沿 `Command` 流推送 `OpenForward`、`DockerOp`（run / stop / start / pause / unpause / rm）与 `ExposeRule`。agent 沿 `AgentEvent` 流上报其握手、心跳与 Docker 事件。
 
-### 指标反向聚合
+### 指标：两个端点，两类关注点
 
-Prometheus 维持**拉取模式**，只抓取**单一**目标 —— controller 的 `/metrics`。在被抓取时，controller 的 handler：
+Prometheus 维持**拉取模式**。controller 暴露**两个**彼此独立的端点（集群内明文 listener 同时提供两者）：
 
-1. 在每个 agent 的既有连接上**并发**反向拉取其 node_exporter 暴露内容。
-2. 为每个 agent 设置**严格短于 `scrape_timeout` 的独立超时**（约 5s，对应默认的 10s）；缓慢 / 失败的 agent 被跳过，从而避免单个慢 agent 拖垮整轮抓取。
-3. **按 `MetricFamily` 合并** —— 用 `expfmt.TextParser` 解码每份暴露内容，为每条 series 注入 `agent=<id>` 标签，按指标名合并为同一个 family（共享一条 HELP/TYPE），最后统一编码一次。
-4. 合成 `agent_up{agent="<id>"}`（1 = 本轮成功抓取，0 = 离线）—— 这是“某个 agent 掉线”的唯一干净信号，因为 Prometheus 只看到一个目标。
+- **`/metrics`**（由 chassis 提供）—— controller **自身**的进程指标。
+- **`GET /api/v1/metrics`** —— **云端对全部 agent 上游 exporter 的聚合**。这才是反向聚合（reverse fan-out）。
+
+当 `/api/v1/metrics` 被抓取时，controller：
+
+1. 枚举在线 agent 全集（Redis `agent→pod` 目录；内存模式下即本副本持有的 agent），以**有界并发**向每个 agent 下发流式 `metrics.scrape` —— 走其本地 `Control` 流，或经 `ControllerPeer.DispatchStream` 中继到持有该 agent 的 pod；
+2. 每个 agent 在本地拉取其配置的 `scrape-targets`（node_exporter、dcgm-exporter……）并将每份暴露内容**分块流式**回传，因此 agent 内存有界、且不受单条消息大小上限限制；
+3. 为每个 agent 设置**严格短于 `scrape_timeout` 的独立超时**（`--agent-scrape-timeout`，默认 5s，对应默认的 10s）；缓慢 / 离线的 agent 被跳过，仅贡献 `agent_up 0`；
+4. **按 `MetricFamily` 合并** —— 用 `expfmt.TextParser` 解码每份暴露内容，为每条 series 注入 `agent=<id>` 与 `exporter=<name>` 标签，将同名指标的 series 合并到同一个 family（共享一条 HELP/TYPE），最后统一编码一次；
+5. 合成 `agent_up{agent="<id>"}`（1 = 本轮流式抓取完成，0 = 离线 / 超时）与 `hostlink_scrape_target_up{agent,exporter}`（单个 exporter 健康度）。`agent_up` 是“某个 agent 掉线”的唯一干净信号，因为 Prometheus 原生 `up` 只反映 controller 端点本身。
 
 > **约束：** **绝不可对暴露内容做字符串拼接。** 同一指标名出现重复的 HELP/TYPE 行会让 Prometheus 解析器拒绝整份载荷。必须在 `MetricFamily` 层级合并。
 
-> node_exporter 作为**独立 sidecar 二进制**运行；agent 在本地 GET `127.0.0.1:9100`。**不要**把 node_exporter 作为库引入 —— 其 collector 包不是稳定的公开 API。
+> 刻意使用 `exporter` 标签（而非 `job` / `instance`），这样注入的标签**无需**在 Prometheus 抓取配置里开启 `honor_labels` 即可保留。exporter 作为**独立 sidecar 二进制**运行；agent 在本地 GET（例如 `127.0.0.1:9100`）。**不要**把 node_exporter 作为库引入 —— 其 collector 包不是稳定的公开 API。
 
 ### 端口转发
 
@@ -315,13 +321,28 @@ controller 还继承 chassis 的 HTTP server 参数（`--http-bind-address`、`-
 - **形态：** 一个 Kubernetes **StatefulSet**（chart 默认 `replicaCount: 1`）。`charts/hostlink/` 的 chart（`helm install <release> charts/hostlink`）渲染出承载 `/etc/humble-mun/controller.yaml` 的 ConfigMap、StatefulSet、一个负载均衡 ClusterIP Service（gRPC + 集群内 HTTP 端口）、一个提供稳定逐 pod DNS 的**无头 `<release>-peer` Service**，以及（当设置了 `ingress.host` 时）面向 agent 的 gRPC Ingress。**高可用请设 `replicaCount > 1`，这要求同时配置 `redis.url` + `peer.enabled`**（否则 chart 在安装时直接报错 —— 半配置的多副本 controller 会对落在兄弟 pod 上的 agent 静默返回 404）。
 - **三个 listener**（chassis 的 HTTP/2 server 在每个 listener 上同时多路复用 gRPC 与 Gin —— `Content-Type: application/grpc` 且 HTTP/2 的流量路由到 gRPC server，其余路由到 Gin）：
   1. 一个 **mTLS gRPC listener**（`--grpc-bind-address` + `WithTLSCert` + `WithMTLS`），供 agent 拨出连接；通过 ingress 对外暴露。
-  2. 一个**明文（h2c）默认 listener**，仅绑定集群内，提供 REST API（`/api/v1/...`）、`/metrics`、`/probe`、`/version` 与 `/logging`。
+  2. 一个**明文（h2c）默认 listener**，仅绑定集群内，提供 REST API（`/api/v1/...`，含聚合的 agent 指标 `/api/v1/metrics`）、controller 自身的 `/metrics`、`/probe`、`/version` 与 `/logging`。
   3.（当 `peer.enabled` 时）一个**集群内 ControllerPeer mTLS listener**，运行在它自己的 `grpc.Server` 上 —— 与共享的 chassis server 分离，使中继平面永不会从面向 agent / ingress 的 listener 上可达。
 - **Ingress（L4 LoadBalancer）：** 供 agent 拨出的 mTLS gRPC 端口。由于 controller 自己终结 mTLS，该 Ingress 必须做 L4/TLS **透传（passthrough）**（通过各 ingress controller 专有的 annotation 显式声明）—— 若在 ingress 处终结 TLS，会剥离 agent 的客户端证书并破坏身份模型。用于隧道暴露的**预留 TCP 端口段**（例如 `1025–2025`）仍为设计项，chart 暂未开放。
 - **依赖：** **Redis** 承载 `agent→pod` 注册表（单副本可选，高可用必需）；API 请求的跨 pod 中继走 ControllerPeer 平面。`port:<P>` 映射 + 端口分配，以及跨 pod 的端口转发数据面，仍为设计项。
 - **证书：** 逐平面，来自挂载的 Secret（`grpc.tlsSecretName` / `peer.tlsSecretName`），或在 `certManager.enabled` 时由 **cert-manager CSI driver** 从配置的 `Issuer`/`ClusterIssuer`（`certManager.issuerKind` / `issuerName`）逐 pod 签发。
 
 > **绕过提示。** chassis server 对每个 listener 都套用同一个 handler，因此明文默认 listener 也会接受 gRPC。这种切分依赖**网络层隔离** —— 默认 listener 只在集群内可达，而 agent gRPC 仅经 ingress 通过 mTLS listener 暴露。
+
+#### 抓取指标
+
+controller 在集群内 HTTP Service（`http` 端口）上暴露**两个**抓取路径：`/metrics`（controller 自身进程指标）与 `/api/v1/metrics`（聚合的 agent exporter 反向聚合，见 §4.3）。chart **不**内置抓取配置 —— 请按你所用监控栈的约定，指向 `http` Service 端口接入。示例：
+
+- **Prometheus 注解发现**（每个路径一个 target）：
+  ```yaml
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8080"
+  prometheus.io/path: "/api/v1/metrics"   # 再为 /metrics 配一份
+  ```
+- **Prometheus Operator `ServiceMonitor`** —— 在 `http` 端口上配两个 `endpoints`，`path: /metrics` 与 `path: /api/v1/metrics`。
+- **VictoriaMetrics `VMServiceScrape`** —— 同样结构：两个 `endpoints`（或 `VMPodScrape`）指向 `http` 端口与上述两个路径。
+
+将 Prometheus job 的 `scrape_timeout` 设得**高于** controller 的 `--agent-scrape-timeout`（默认 5s），让 fan-out 的逐 agent 超时先触发。`/api/v1/metrics` 的 series 已带 `agent`/`exporter` 标签，无需 `honor_labels`。
 
 ### hostlink（外部主机）
 
@@ -378,11 +399,11 @@ controller 还继承 chassis 的 HTTP server 参数（`--http-bind-address`、`-
 - [x] agent **工作目录文件系统**接口（`/api/v1/agents/<id>/files`）：浏览（`fs.stat`+`fs.list`）、`fs.read` 分块下载、multipart 分块 `fs.write` 上传（独占创建 + `PUT` 覆盖）、`fs.mkdir`、递归 `fs.remove`；两个方向均有界内存流式（`AgentRequestChunk` + 跨 pod `ControllerPeer.Upload` 中继），含 `--data-dir` 工作目录与路径越界防护
 - [x] Redis `agent→pod` 注册表（写入/比较删除/TTL 刷新，支持单机/哨兵/集群三种拓扑）与经 `ControllerPeer.Dispatch`（一元）及 `DispatchStream`（流式）的跨 pod API 请求中继，含陈旧映射的拒绝并重试
 - [x] Helm chart：StatefulSet + 无头 peer Service；可选 Redis、peer 平面与 cert-manager CSI 证书签发；多副本配置守卫
+- [x] 指标聚合：agent `scrape-targets`（node_exporter / dcgm / …）按需拉取并**流式**回传；controller `GET /api/v1/metrics` 有界并发反向聚合 + `agent`/`exporter` 标签注入 + `MetricFamily` 合并 + 合成 `agent_up` / `hostlink_scrape_target_up`，经 `ControllerPeer.DispatchStream` 跨 pod 感知
 
 ### 进行中 / 计划中（MVP）
 
 - [ ] 容器生命周期操作：`DockerOp`（run/stop/start/rm）执行；`DockerEvent` 上报
-- [ ] 指标：node_exporter sidecar + agent 本地拉取；controller `/metrics` 并发聚合 + `MetricFamily` 合并 + `agent_up`
 - [ ] 端口转发：集成 `openconfig/grpctunnel`（先验证半关闭）；`ExposeRule` / `OpenForward`；带半关闭 + 背压的 `Frame` 中继（`Forward` 目前是占位桩）
 - [ ] 多副本**端口转发**：`port:<P>` 映射 + 原子端口池分配，以及端口转发数据面的跨 pod 两跳中继（API 请求中继已实现）
 - [ ] 生命周期联动：Docker 事件驱动暴露的建立 / 挂起 / 重建

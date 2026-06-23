@@ -80,6 +80,11 @@ func New(logger logr.Logger, nodeName string) (ag Agent, err error) {
 		return nil, err
 	}
 
+	var scrapeTargets []scrapeTarget
+	if scrapeTargets, err = resolveScrapeTargets(); err != nil {
+		return nil, err
+	}
+
 	creds, err := clientTransportCredentials()
 	if err != nil {
 		return nil, err
@@ -125,13 +130,14 @@ func New(logger logr.Logger, nodeName string) (ag Agent, err error) {
 	}
 
 	ag = &agent{
-		logger:   logger.WithName("agent"),
-		nodeName: nodeName,
-		dataDir:  dataDir,
-		conn:     conn,
-		client:   hostlinkv1.NewAgentLinkClient(conn),
-		docker:   docker,
-		inbound:  make(map[string]*inboundStream),
+		logger:        logger.WithName("agent"),
+		nodeName:      nodeName,
+		dataDir:       dataDir,
+		scrapeTargets: scrapeTargets,
+		conn:          conn,
+		client:        hostlinkv1.NewAgentLinkClient(conn),
+		docker:        docker,
+		inbound:       make(map[string]*inboundStream),
 	}
 	return ag, nil
 }
@@ -143,6 +149,11 @@ type agent struct {
 	conn     *grpc.ClientConn
 	client   hostlinkv1.AgentLinkClient
 	docker   *client.Client
+
+	// scrapeTargets are the resolved upstream exporters pulled on a metrics.scrape
+	// request, each carrying its own request URL and HTTP client. An empty list
+	// disables the feature.
+	scrapeTargets []scrapeTarget
 
 	stream grpc.BidiStreamingClient[hostlinkv1.AgentEvent, hostlinkv1.Command]
 	sendMu sync.Mutex
@@ -348,6 +359,8 @@ func (a *agent) startRequest(ctx context.Context, req *hostlinkv1.AgentRequest, 
 		go a.handlePull(ctx, req, logger)
 	case agentapi.MethodFsRead:
 		go a.handleRead(ctx, req, logger)
+	case agentapi.MethodMetricsScrape:
+		go a.handleScrape(ctx, req, logger)
 	case agentapi.MethodFsWrite:
 		reg := a.registerInbound(req.GetRequestId())
 		go a.handleWrite(ctx, req, reg, logger)

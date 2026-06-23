@@ -45,6 +45,11 @@ multipart upload, recursive delete) over the directory set by `data-dir`
 (default `/var/lib/hostlink`, provisioned by the unit's `StateDirectory` — see
 [Step 5](#step-5--install-and-start-the-unit)). This needs no Docker.
 
+If `scrape-targets` is configured, the agent also pulls those local exporters
+(node_exporter, dcgm-exporter, …) on demand and streams their exposition to the
+controller, which aggregates the whole fleet behind its own `GET /api/v1/metrics`
+(separate from the controller's self-metrics `/metrics`). This also needs no Docker.
+
 ## Step 1 — build and install the binary
 
 Build the agent (the module is vendored; build offline with `-mod=vendor`). On a
@@ -123,6 +128,7 @@ The keys are the flag names verbatim:
 | `agent-tls-key-path` | yes | Path to `tls.key` (default `/etc/humble-mun/agent/tls.key`) |
 | `node-name` | recommended | Logical name for this host; becomes the `agent_id` the controller sees — set it to the hostname or another stable identifier |
 | `data-dir` | recommended | Working directory the `files` API browses/serves (`/var/lib/hostlink` in the shipped config). Empty disables the `files` API. Let the unit's `StateDirectory` create and own it — do **not** `mkdir`/`chown` it by hand (see [Step 5](#step-5--install-and-start-the-unit)) |
+| `scrape-targets` | optional | List of upstream exporters (each `{name, url}`, optional `path`) the agent pulls when the controller fans out a metrics scrape; the controller aggregates them behind its own `GET /api/v1/metrics`, labelling each series `agent=<node-name>`/`exporter=<name>`. `url` is `http(s)://host:port[/path]` (path defaults to `/metrics`) or `unix:///path/to.sock` (a unix domain socket; HTTP path defaults to `/metrics`, override with `path`). A YAML list, not a scalar flag — see the example in `hostlink.yaml`. Empty/omitted disables it. |
 
 A minimal config (matching the debug PKI's `agent-demo`):
 

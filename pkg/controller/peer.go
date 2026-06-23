@@ -315,7 +315,10 @@ func (p *peerClients) conn(addr string) (conn *grpc.ClientConn, err error) {
 		return
 	}
 
-	dialOpts := []grpc.DialOption{grpc.WithTransportCredentials(p.creds)}
+	dialOpts := []grpc.DialOption{
+		grpc.WithTransportCredentials(p.creds),
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(GRPCMaxRecvMsgSize())),
+	}
 	if p.serverName != "" {
 		dialOpts = append(dialOpts, grpc.WithAuthority(p.serverName))
 	}
@@ -423,7 +426,7 @@ func startPeerServer(logger logr.Logger, bindAddr string, reg *registry) (srv *g
 		return
 	}
 
-	srv = grpc.NewServer(grpc.Creds(creds))
+	srv = grpc.NewServer(grpc.Creds(creds), grpc.MaxRecvMsgSize(GRPCMaxRecvMsgSize()))
 	hostlinkv1.RegisterControllerPeerServer(srv, &peerServer{logger: logger, registry: reg})
 
 	stopped := make(chan struct{})

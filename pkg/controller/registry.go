@@ -248,10 +248,10 @@ func (r *streamReg) close() {
 }
 
 // streamReliable reports whether a streaming method requires lossless delivery.
-// File reads carry bytes that must never be dropped; progress streams (images.pull)
-// are advisory and may drop frames under a slow consumer.
+// File reads and metrics scrapes carry bytes that must never be dropped; progress
+// streams (images.pull) are advisory and may drop frames under a slow consumer.
 func streamReliable(method string) bool {
-	return method == agentapi.MethodFsRead
+	return method == agentapi.MethodFsRead || method == agentapi.MethodMetricsScrape
 }
 
 func newAgentConn(agentID string, stream grpc.BidiStreamingServer[hostlinkv1.AgentEvent, hostlinkv1.Command], logger logr.Logger) *agentConn {
