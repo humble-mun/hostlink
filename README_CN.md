@@ -278,6 +278,8 @@ agent↔controller 连接需要一套可用的 PKI。你需要一个 CA、一份
 
 controller 要求且验证 agent 客户端证书（`RequireAndVerifyClientCert`）；agent 验证 controller 的服务名（`--controller-tls-server-name`）。若留空，gRPC 会以拨号 endpoint 的主机名进行验证，因此当证书 SAN 与拨号地址不一致时（例如以 IP 拨号）必须显式设置。**没有不安全回退** —— 若证书缺失或无效，连接将硬性失败。
 
+**证书热加载。** 所有 TLS 材料（服务端/客户端证书、私钥与 CA bundle）在文件被原地轮换时都会透明地从磁盘重新加载 —— 新材料在下一次握手时生效，**无需重启进程**。这覆盖面向 agent 的 gRPC listener、ControllerPeer 平面（其服务端与客户端两侧），以及 chassis 默认 listener。因此由 **cert-manager**（或 cert-manager CSI driver）签发的短期证书会在续期时被自动采用；长时间运行的 controller 或 agent 不会再使用过期的旧证书。重新加载失败（例如文件短暂缺失或格式损坏）会被记录日志，并继续沿用上一次成功加载的材料。
+
 ---
 
 ## 命令行参数

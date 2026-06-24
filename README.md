@@ -281,6 +281,8 @@ The agent↔controller connection requires a working PKI. You need a CA, a contr
 
 The controller requires-and-verifies the agent client certificate (`RequireAndVerifyClientCert`); the agent verifies the controller's server name (`--controller-tls-server-name`). If left empty, gRPC verifies against the dial endpoint's host, so set it explicitly whenever the certificate SAN differs from the dial address (e.g. dialing by IP). There is **no insecure fallback** — if certificates are missing or invalid, the connection fails hard.
 
+**Certificate hot-reload.** All TLS material (server/client certificates, keys, and CA bundles) is reloaded from disk transparently when the file rotates in place — the new material takes effect on the next handshake with **no process restart**. This covers the agent-facing gRPC listener, the ControllerPeer plane (both its server and client sides), and the chassis default listener. As a result, short-lived certificates issued by **cert-manager** (or the cert-manager CSI driver) are picked up automatically as they are renewed; a long-running controller or agent never serves a stale, expired certificate. Reload failures (e.g. a transiently missing or malformed file) are logged and the previously loaded material continues to be served.
+
 ---
 
 ## CLI Flags

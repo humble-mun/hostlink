@@ -96,7 +96,7 @@ func (svc *service) startPeerPlane(logger logr.Logger, reg *registry) (err error
 	}
 
 	var clientCreds credentials.TransportCredentials
-	if clientCreds, err = peerClientCredentials(); err != nil {
+	if clientCreds, err = peerClientCredentials(logger.WithName("client")); err != nil {
 		return
 	}
 	svc.peers = newPeerClients(logger.WithName("client"), clientCreds, viper.GetString(flagPeerTLSServerName))

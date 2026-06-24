@@ -2,13 +2,12 @@ package controller
 
 import (
 	"context"
-	"crypto/tls"
+	cryptotls "crypto/tls"
 	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
 	"net"
-	"os"
 	"sync"
 
 	"github.com/go-logr/logr"
@@ -17,6 +16,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/status"
+
+	chassistls "github.com/humble-mun/chassis/pkg/tls"
 
 	hostlinkv1 "github.com/humble-mun/hostlink/pkg/api/hostlink/v1"
 )
@@ -345,45 +346,11 @@ func (p *peerClients) close() (err error) {
 }
 
 // peerServerCredentials builds the mTLS credentials the ControllerPeer listener
-// presents and uses to require-and-verify sibling client certificates. There is
-// no insecure fallback.
-func peerServerCredentials() (creds credentials.TransportCredentials, err error) {
-	var cert tls.Certificate
-	var pool *x509.CertPool
-	if cert, pool, err = peerCertAndCAPool(); err != nil {
-		return
-	}
-	creds = credentials.NewTLS(&tls.Config{
-		Certificates: []tls.Certificate{cert},
-		ClientCAs:    pool,
-		ClientAuth:   tls.RequireAndVerifyClientCert,
-		MinVersion:   tls.VersionTLS13,
-	})
-	return
-}
-
-// peerClientCredentials builds the mTLS credentials used to dial siblings: it
-// presents the same controller certificate and verifies the sibling against the
-// peer CA.
-func peerClientCredentials() (creds credentials.TransportCredentials, err error) {
-	var cert tls.Certificate
-	var pool *x509.CertPool
-	if cert, pool, err = peerCertAndCAPool(); err != nil {
-		return
-	}
-	creds = credentials.NewTLS(&tls.Config{
-		Certificates: []tls.Certificate{cert},
-		RootCAs:      pool,
-		ServerName:   viper.GetString(flagPeerTLSServerName),
-		MinVersion:   tls.VersionTLS13,
-	})
-	return
-}
-
-// peerCertAndCAPool loads the shared controller certificate/key pair and the CA
-// bundle used on the ControllerPeer plane, where the controller acts as both
-// server and client.
-func peerCertAndCAPool() (cert tls.Certificate, pool *x509.CertPool, err error) {
+// presents and uses to require-and-verify sibling client certificates. The
+// certificate and the client-CA trust bundle are loaded through chassis
+// reloaders so an in-place rotation (e.g. a cert-manager renewal) is picked up on
+// the next handshake without a process restart. There is no insecure fallback.
+func peerServerCredentials(logger logr.Logger) (creds credentials.TransportCredentials, err error) {
 	certPath := viper.GetString(flagPeerTLSCertPath)
 	keyPath := viper.GetString(flagPeerTLSKeyPath)
 	caPath := viper.GetString(flagPeerTLSCAPath)
@@ -392,21 +359,87 @@ func peerCertAndCAPool() (cert tls.Certificate, pool *x509.CertPool, err error) 
 		return
 	}
 
-	if cert, err = tls.LoadX509KeyPair(certPath, keyPath); err != nil {
-		err = fmt.Errorf("load peer certificate/key pair: %w", err)
+	var certReloader *chassistls.CertReloader
+	if certReloader, err = chassistls.NewCertReloader(logger, certPath, keyPath); err != nil {
+		err = fmt.Errorf("peer server certificate: %w", err)
+		return
+	}
+	var caReloader *chassistls.CAReloader
+	if caReloader, err = chassistls.NewCAReloader(logger, caPath); err != nil {
+		err = fmt.Errorf("peer client CA: %w", err)
 		return
 	}
 
-	var caPEM []byte
-	if caPEM, err = os.ReadFile(caPath); err != nil {
-		err = fmt.Errorf("read peer CA bundle %q: %w", caPath, err)
+	// GetCertificate reloads the presented certificate per handshake; the client-CA
+	// pool is stamped onto a clone of base per connection via GetConfigForClient,
+	// so both rotate without a restart. ClientCAs on base is left nil because
+	// GetConfigForClient supplies the current pool for every accepted connection.
+	base := &cryptotls.Config{
+		GetCertificate: certReloader.GetCertificate,
+		ClientAuth:     cryptotls.RequireAndVerifyClientCert,
+		MinVersion:     cryptotls.VersionTLS13,
+	}
+	base.GetConfigForClient = caReloader.ConfigForClient(base)
+	creds = credentials.NewTLS(base)
+	return
+}
+
+// peerClientCredentials builds the mTLS credentials used to dial siblings: it
+// presents the controller certificate and verifies the sibling against the peer
+// CA. Both the presented certificate and the verifying CA pool are loaded through
+// chassis reloaders, so a rotation is picked up on the next dial/handshake
+// without a process restart.
+func peerClientCredentials(logger logr.Logger) (creds credentials.TransportCredentials, err error) {
+	certPath := viper.GetString(flagPeerTLSCertPath)
+	keyPath := viper.GetString(flagPeerTLSKeyPath)
+	caPath := viper.GetString(flagPeerTLSCAPath)
+	if certPath == "" || keyPath == "" || caPath == "" {
+		err = fmt.Errorf("peer plane mTLS requires %s, %s, and %s to be set", flagPeerTLSCertPath, flagPeerTLSKeyPath, flagPeerTLSCAPath)
 		return
 	}
-	pool = x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(caPEM) {
-		err = fmt.Errorf("no certificates found in peer CA bundle %q", caPath)
+
+	var certReloader *chassistls.CertReloader
+	if certReloader, err = chassistls.NewCertReloader(logger, certPath, keyPath); err != nil {
+		err = fmt.Errorf("peer client certificate: %w", err)
 		return
 	}
+	var caReloader *chassistls.CAReloader
+	if caReloader, err = chassistls.NewCAReloader(logger, caPath); err != nil {
+		err = fmt.Errorf("peer root CA: %w", err)
+		return
+	}
+
+	serverName := viper.GetString(flagPeerTLSServerName)
+	// crypto/tls offers no reload hook for RootCAs, so verification is done
+	// manually against the current pool: skip the library's default chain check
+	// and verify in VerifyConnection, which is invoked per handshake and so reads
+	// the freshly reloaded CA pool each time. GetClientCertificate reloads the
+	// presented certificate per handshake.
+	creds = credentials.NewTLS(&cryptotls.Config{
+		GetClientCertificate: func(*cryptotls.CertificateRequestInfo) (*cryptotls.Certificate, error) {
+			return certReloader.GetCertificate(nil)
+		},
+		ServerName:         serverName,
+		InsecureSkipVerify: true, //nolint:gosec // chain is verified manually in VerifyConnection against the reloaded CA pool
+		MinVersion:         cryptotls.VersionTLS13,
+		VerifyConnection: func(cs cryptotls.ConnectionState) error {
+			if len(cs.PeerCertificates) == 0 {
+				return fmt.Errorf("peer presented no certificate")
+			}
+			opts := x509.VerifyOptions{
+				Roots:         caReloader.CurrentPool(),
+				DNSName:       serverName,
+				Intermediates: x509.NewCertPool(),
+			}
+			for _, inter := range cs.PeerCertificates[1:] {
+				opts.Intermediates.AddCert(inter)
+			}
+			if _, verr := cs.PeerCertificates[0].Verify(opts); verr != nil {
+				return fmt.Errorf("verify peer certificate: %w", verr)
+			}
+			return nil
+		},
+	})
 	return
 }
 
@@ -416,7 +449,7 @@ func peerCertAndCAPool() (cert tls.Certificate, pool *x509.CertPool, err error) 
 // shutdown. Bind errors surface synchronously so a misconfiguration fails fast.
 func startPeerServer(logger logr.Logger, bindAddr string, reg *registry) (srv *grpc.Server, done <-chan struct{}, err error) {
 	var creds credentials.TransportCredentials
-	if creds, err = peerServerCredentials(); err != nil {
+	if creds, err = peerServerCredentials(logger); err != nil {
 		return
 	}
 
