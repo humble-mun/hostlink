@@ -10,9 +10,9 @@ deploy/
 ```
 
 The agent is a single static Go binary. It dials **outbound** to the cloud-side
-`hostlink-controller` over a mutually-authenticated TLS (mTLS) gRPC connection
-and keeps it open — so the host needs no inbound firewall rules, only outbound
-reachability to the controller.
+controller (the `hostlink` container in Kubernetes) over a mutually-authenticated
+TLS (mTLS) gRPC connection and keeps it open — so the host needs no inbound
+firewall rules, only outbound reachability to the controller.
 
 > This guide installs an agent on a host. It assumes you already have the mTLS
 > material (`ca.crt`, `tls.crt`, `tls.key`) for this agent. For a workstation /
@@ -30,10 +30,13 @@ reachability to the controller.
 | `root` / `sudo` | To install the binary, create the service user, and write under `/etc/humble-mun/` |
 
 Docker is used **lazily**: the agent opens a Docker client (`client.FromEnv`) but
-does not dial the daemon until a request needs it. The implemented requests are
-the Docker **images** methods — `images.list`, `images.pull`, `images.remove`
-(behind the controller's `GET`/`POST`/`DELETE /api/v1/agents/<id>/images`) — which
-talk to the local Docker daemon, so for those endpoints to work the daemon must
+does not dial the daemon until a request needs it. The implemented Docker-backed
+requests are the **images** methods — `images.list`, `images.pull`, `images.remove`
+(behind the controller's `GET`/`POST`/`DELETE /api/v1/agents/<id>/images`) — and
+the **container** methods — `containers.list` / `containers.create` (docker run) /
+`containers.inspect` / `containers.start` / `containers.stop` / `containers.restart` /
+`containers.remove` / `containers.logs` (streaming, behind
+`/api/v1/agents/<id>/containers[...]`). For those endpoints to work the daemon must
 be reachable and the service user must be able to access the Docker socket (add `hostlink` to
 the `docker` group — see [Step 4](#step-4--create-the-service-user)). The agent
 itself still starts and runs the `Control` stream (`Hello` + `Heartbeat`) without

@@ -1,5 +1,5 @@
 ARG GO_VERSION=1.26.4-trixie
-ARG BASE_IMAGE=gcr.io/distroless/base-debian13:latest
+ARG BASE_IMAGE=gcr.io/distroless/static-debian13:latest
 
 FROM golang:${GO_VERSION} AS builder
 
@@ -7,7 +7,7 @@ ARG BASE_PROJECT=github.com/humble-mun/chassis
 ARG PROJECT=github.com/humble-mun/hostlink
 ARG ARCH=amd64
 ARG VERSION_PACKAGE=pkg/version
-ARG NAME=controller
+ARG NAME=hostlink
 ARG VARIANT
 ARG GC_FLAGS
 ARG LD_FLAGS="-w -s"
@@ -23,12 +23,12 @@ RUN --mount=type=bind,source=/,target=/go/src/${PROJECT} go build \
 -X \"${BASE_PROJECT}/${VERSION_PACKAGE}.Architecture=${ARCH}\" \
 -X \"${BASE_PROJECT}/${VERSION_PACKAGE}.Variant=${VARIANT}\" \
 -X \"${BASE_PROJECT}/${VERSION_PACKAGE}.RecentCommits=`git log -n 20 --oneline | tee /dev/null `\"" \
--o /opt/humble-mun/${NAME}.elf ${PROJECT}/cmd/${NAME}
+-o /opt/humble-mun/${NAME}.elf ${PROJECT}/cmd/controller
 
 FROM ${BASE_IMAGE}
-ARG NAME=controller
+ARG NAME=hostlink
 ENV GIN_MODE=release
 COPY --from=builder /opt/humble-mun/${NAME}.elf /usr/local/bin/${NAME}
 VOLUME ["/etc/humble-mun"]
 EXPOSE 8080
-ENTRYPOINT ["controller"]
+ENTRYPOINT ["hostlink"]

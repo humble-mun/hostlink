@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/go-logr/logr"
 
 	"github.com/humble-mun/hostlink/pkg/agentapi"
 	hostlinkv1 "github.com/humble-mun/hostlink/pkg/api/hostlink/v1"
@@ -107,9 +108,9 @@ type pullRequestBody struct {
 	Auth  *agentapi.RegistryAuth `json:"auth,omitempty"`
 }
 
-// pullDoneFrame is the terminal SSE event emitted once the agent reports the
-// pull finished (successfully or not).
-type pullDoneFrame struct {
+// streamDoneFrame is the terminal SSE event emitted once a streamed operation
+// (images.pull, containers.logs) finishes, successfully or not.
+type streamDoneFrame struct {
 	Done  bool   `json:"done"`
 	Code  uint32 `json:"code,omitempty"`
 	Error string `json:"error,omitempty"`
@@ -280,6 +281,17 @@ func (svc *service) pullAgentImage(c *gin.Context) {
 		}
 		return
 	}
+
+	serveSSEStream(c, logger, frames, done, cancel)
+}
+
+// serveSSEStream writes a dispatched stream to the client as Server-Sent
+// Events: each progress frame's JSON payload becomes one data event, and the
+// terminal frame (or an agent disconnect) becomes a closing streamDoneFrame
+// event. cancel is always invoked when the client stops reading, which tears
+// the dispatch down and — for unbounded streams like a followed
+// containers.logs — stops the agent-side operation.
+func serveSSEStream(c *gin.Context, logger logr.Logger, frames <-chan streamFrame, done <-chan struct{}, cancel func()) {
 	defer cancel()
 
 	flusher, ok := c.Writer.(http.Flusher)
@@ -299,7 +311,7 @@ func (svc *service) pullAgentImage(c *gin.Context) {
 	// emit writes one frame as SSE and reports whether the stream is finished.
 	emit := func(frame streamFrame) (finished bool) {
 		if frame.Final {
-			writeSSEEvent(c.Writer, pullDoneFrame{Done: true, Code: frame.Code, Error: frame.Error})
+			writeSSEEvent(c.Writer, streamDoneFrame{Done: true, Code: frame.Code, Error: frame.Error})
 			flusher.Flush()
 			return true
 		}
@@ -312,7 +324,7 @@ func (svc *service) pullAgentImage(c *gin.Context) {
 	}
 
 	consumeStream(c.Request.Context(), frames, done, emit, func() {
-		writeSSEEvent(c.Writer, pullDoneFrame{Done: true, Error: "agent disconnected"})
+		writeSSEEvent(c.Writer, streamDoneFrame{Done: true, Error: "agent disconnected"})
 		flusher.Flush()
 	})
 }

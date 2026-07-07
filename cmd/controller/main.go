@@ -17,8 +17,8 @@ func newRootCommand() *cobra.Command {
 	var init func() error
 	cmd := &cobra.Command{
 		Use:   version.Name,
-		Short: "hostlink-controller is the cloud-side control plane that manages external hosts and their containers.",
-		Long: "hostlink-controller is the cloud-side component of hostlink. It runs in Kubernetes (with multiple " +
+		Short: "hostlink is the cloud-side control plane that manages external hosts and their containers.",
+		Long: "hostlink is the cloud-side component of hostlink. It runs in Kubernetes (with multiple " +
 			"replicas for HA) and acts as the gRPC server that NAT-side hostlink agents dial out to over a" +
 			"persistent connection. It dispatches Docker and exposure commands to agents, aggregates their " +
 			"metrics into a single Prometheus endpoint, and drives reverse TCP tunnels for dynamic port forwarding.",

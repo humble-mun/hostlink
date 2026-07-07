@@ -32,10 +32,10 @@ metadata:
   name: {{ .Release.Name }}
   namespace: {{ .Release.Namespace }}
 data:
-  # viper reads /etc/humble-mun/controller.yaml at startup (configName =
+  # viper reads /etc/humble-mun/hostlink.yaml at startup (configName =
   # "controller", set from the binary name via the version.Name ldflag).
   # Keys are the flag names with dashes (chassis maps them 1:1 to flags).
-  controller.yaml: |+
+  hostlink.yaml: |+
     # Default listener: left plaintext (h2c) for in-cluster metrics/probe.
     # tls-cert-path / tls-key-path are deliberately empty so the chassis
     # default listener does not terminate TLS here.
@@ -108,13 +108,13 @@ spec:
 
       containers:
       # -----------------------------------------------------------------------
-      # Main container: the hostlink-controller.
-      # All configuration is sourced from /etc/humble-mun/controller.yaml (viper).
+      # Main container: the hostlink controller.
+      # All configuration is sourced from /etc/humble-mun/hostlink.yaml (viper).
       # -----------------------------------------------------------------------
       - name: controller
         image: {{ .Values.image }}
         command:
-        - controller
+        - hostlink
         env:
         - name: HM_NODE_NAME
           valueFrom:
@@ -152,18 +152,17 @@ spec:
         - name: grpc
           containerPort: {{ $grpcPort }}
           protocol: TCP
-        # Controller<->controller (ControllerPeer) mTLS listener. Reached only
-        # in-cluster via the headless Service per-pod DNS; never exposed through
-        # the ingress. Declared here as forward-prep -- nothing binds it until
-        # the ControllerPeer service lands.
+        # Controller<->controller (ControllerPeer) mTLS listener, bound when
+        # peer.enabled sets --peer-bind-address. Reached only in-cluster via the
+        # headless Service per-pod DNS; never exposed through the ingress.
         - name: peer
           containerPort: {{ $peerPort }}
           protocol: TCP
         volumeMounts:
         # viper config file mounted as a single file via subPath.
         - name: config
-          mountPath: /etc/humble-mun/controller.yaml
-          subPath: controller.yaml
+          mountPath: /etc/humble-mun/hostlink.yaml
+          subPath: hostlink.yaml
           readOnly: true
         # mTLS server cert/key + agent CA bundle.
         - name: grpc-pki

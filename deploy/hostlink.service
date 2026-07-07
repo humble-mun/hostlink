@@ -5,10 +5,11 @@
 # are named simply 'hostlink' (not 'hostlink-agent').
 #
 # The agent is a single static Go binary that runs on each external Linux host
-# (on-prem / colo, behind NAT). It dials OUTBOUND to the cloud-side
-# hostlink-controller over a mutually-authenticated TLS (mTLS) gRPC connection
-# and keeps it open: it sends a Hello, then heartbeats, and (by design) will
-# carry command, metrics and port-forward traffic over that one connection.
+# (on-prem / colo, behind NAT). It dials OUTBOUND to the cloud-side controller
+# (the hostlink container in Kubernetes) over a mutually-authenticated TLS
+# (mTLS) gRPC connection and keeps it open: it sends a Hello, then heartbeats,
+# and carries command, container, filesystem, and metrics traffic (and, by
+# design, port-forward traffic) over that one connection.
 #
 # Install:
 #   1. Copy the binary to /usr/local/bin/hostlink
@@ -38,15 +39,16 @@
 #   configuration lives entirely in the config file, not in the unit.
 
 [Unit]
-Description=hostlink agent (external-host control-plane link to hostlink-controller)
+Description=hostlink agent (external-host link to the hostlink controller)
 Documentation=https://github.com/humble-mun/hostlink
 # The agent only needs outbound reachability to the controller; wait for the
 # network to be configured before dialing out.
 Wants=network-online.target
 After=network-online.target
-# The agent is designed to manage the local Docker daemon. No code path opens
-# the Docker socket yet, so Docker is a soft (Wants) ordering dependency, not a
-# hard requirement: the link to the controller still comes up without it.
+# The agent manages the local Docker daemon (images and containers), but the
+# Docker client is lazy — the daemon is dialed only when a request needs it —
+# so Docker is a soft (Wants) ordering dependency, not a hard requirement: the
+# link to the controller still comes up without it.
 Wants=docker.service
 After=docker.service
 

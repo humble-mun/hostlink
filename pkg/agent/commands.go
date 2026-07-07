@@ -17,8 +17,9 @@ import (
 
 // handleRequest dispatches a controller request by method and packages the
 // outcome as an AgentResult event. code mirrors an HTTP status so the REST layer
-// can map it back directly. It serves single-shot methods; the streaming
-// images.pull method is handled separately by handleAndReply.
+// can map it back directly. It serves single-shot methods only; the streaming
+// methods (images.pull, fs.read, fs.write, metrics.scrape, containers.logs) are
+// dispatched separately by startRequest.
 func (a *agent) handleRequest(ctx context.Context, req *hostlinkv1.AgentRequest) (event *hostlinkv1.AgentEvent) {
 	result := &hostlinkv1.AgentResult{RequestId: req.GetRequestId(), Final: true}
 	switch req.GetMethod() {
@@ -26,6 +27,20 @@ func (a *agent) handleRequest(ctx context.Context, req *hostlinkv1.AgentRequest)
 		result.Payload, result.Code, result.Error = a.listImages(ctx)
 	case agentapi.MethodImagesRemove:
 		result.Payload, result.Code, result.Error = a.removeImages(ctx, req)
+	case agentapi.MethodContainersList:
+		result.Payload, result.Code, result.Error = a.listContainers(ctx, req)
+	case agentapi.MethodContainersCreate:
+		result.Payload, result.Code, result.Error = a.createContainer(ctx, req)
+	case agentapi.MethodContainersInspect:
+		result.Payload, result.Code, result.Error = a.inspectContainer(ctx, req)
+	case agentapi.MethodContainersStart:
+		result.Code, result.Error = a.startContainer(ctx, req)
+	case agentapi.MethodContainersStop:
+		result.Code, result.Error = a.stopContainer(ctx, req)
+	case agentapi.MethodContainersRestart:
+		result.Code, result.Error = a.restartContainer(ctx, req)
+	case agentapi.MethodContainersRemove:
+		result.Code, result.Error = a.removeContainer(ctx, req)
 	case agentapi.MethodFsStat:
 		result.Payload, result.Code, result.Error = a.statPath(req)
 	case agentapi.MethodFsList:

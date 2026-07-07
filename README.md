@@ -7,16 +7,23 @@
 > heartbeat); a generic request/response dispatch envelope with REST endpoint
 > families for **Docker images** (`GET`/`POST`/`DELETE
 > /api/v1/agents/<id>/images` — list, pull with streaming SSE progress, and
-> remove) and an agent **working-directory filesystem** (`GET`/`POST`/`PUT`/`DELETE
+> remove), **Docker containers** (`/api/v1/agents/<id>/containers` — list,
+> create-and-start with docker run semantics, inspect, start/stop/restart,
+> remove, and an SSE **log stream** with `?follow`), and an agent
+> **working-directory filesystem** (`GET`/`POST`/`PUT`/`DELETE
 > /api/v1/agents/<id>/files` — browse, download, streamed multipart upload, and
 > recursive delete), served by an agent-side Docker client and a sandboxed data
 > directory; a **metrics aggregation** endpoint (`GET /api/v1/metrics`) that
 > streams and merges each agent's configured exporters; the Redis-backed
 > `agent→pod` registry; and cross-pod API relay via the `ControllerPeer` plane
-> (multi-replica HA). Still **designed but not yet implemented**: container
-> *lifecycle* ops (`DockerOp`/events), port forwarding, and the cross-pod
+> (multi-replica HA), including cancel propagation for followed log streams.
+> Still **designed but not yet implemented**: Docker *event* reporting, the
+> controller-side log relay into Loki, port forwarding, and the cross-pod
 > port-forward data plane — see [Roadmap](#roadmap). Do not deploy this as a
 > control plane for real workloads yet.
+>
+> Released as **v0.x pre-releases**: the REST API, wire protocol, and
+> configuration may change without notice until v1.0.0.
 
 A control plane for managing Linux hosts that live **outside the cloud** (on-prem / colo servers). These hosts are **not** Kubernetes nodes; their workloads run as **Docker containers**, not pods. `hostlink` gives the cloud a persistent, mutually-authenticated channel to each NAT'd host for command dispatch, container lifecycle, metrics, and raw-TCP port forwarding — with no inbound connectivity required to the host.
 
@@ -30,6 +37,7 @@ A control plane for managing Linux hosts that live **outside the cloud** (on-pre
   - [Connection Model](#connection-model)
   - [Command Channel](#command-channel)
   - [Metrics Reverse Fan-out](#metrics-reverse-fan-out)
+  - [Container Logs](#container-logs)
   - [Port Forwarding](#port-forwarding)
   - [Multi-replica Affinity](#multi-replica-affinity)
   - [Container Lifecycle](#container-lifecycle)
@@ -49,10 +57,12 @@ A control plane for managing Linux hosts that live **outside the cloud** (on-pre
 
 ## Overview
 
-`hostlink` builds two binaries from a single Go module:
+`hostlink` builds two binaries from a single Go module — **both named `hostlink`**, disambiguated by where they run:
 
-- **`hostlink-controller`** — runs in the cloud, inside Kubernetes. The control plane. It is the gRPC **server**, terminates mutual TLS for agents, and (by design) aggregates metrics, allocates public ports, and routes forwarded TCP across replicas.
-- **`hostlink`** — runs on each external host as a systemd service. It is the gRPC **client**: it dials out to the controller (so it works behind NAT with no inbound firewall rules), drives the local Docker daemon, reports metrics, and carries tunnels.
+- the **controller** — runs in the cloud, inside Kubernetes, as a container (image `hostlink`). The control plane. It is the gRPC **server**, terminates mutual TLS for agents, and (by design) aggregates metrics, allocates public ports, and routes forwarded TCP across replicas.
+- the **agent** — runs on each external host as a systemd service (binary `/usr/local/bin/hostlink`). It is the gRPC **client**: it dials out to the controller (so it works behind NAT with no inbound firewall rules), drives the local Docker daemon, reports metrics, and carries tunnels.
+
+> **Naming.** The former `hostlink-controller` name is retired: the controller only ever runs as a container inside Kubernetes and the agent is the only hostlink piece installed on a host, so a bare `hostlink` is unambiguous in each context. Docs use the role names "controller"/"agent"; both binaries read `/etc/humble-mun/hostlink.yaml`.
 
 The premise that shapes everything below: **under HTTP/2 a server cannot open a stream to a client.** The agent is behind NAT and must be the dialer, so every "controller → agent" interaction is modeled as a *reverse* flow over a connection the agent established.
 
@@ -71,7 +81,7 @@ The premise that shapes everything below: **under HTTP/2 a server cannot open a 
 
 ```
 external host (behind NAT)                cloud (Kubernetes)
-  hostlink                          hostlink-controller (≥2 replicas)
+  hostlink (agent)                  hostlink (controller, ≥2 replicas)
        │                                          │
        │── dial out (mTLS, TLS 1.3) ────────────► │  one gRPC connection per agent
        │                                          │
@@ -79,7 +89,7 @@ external host (behind NAT)                cloud (Kubernetes)
        │     Hello (handshake) ─────────────────► │
        │     Heartbeat (refresh TTL) ───────────► │
        │                                          │
-       │ ◄──────────── Command (push) ─────────── │  OpenForward / DockerOp / ExposeRule
+       │ ◄──────────── Command (push) ─────────── │  AgentRequest (images/containers/fs/…) / OpenForward / ExposeRule
        │                                          │
        │── Forward(stream Frame) ───────────────► │  one stream per forwarded TCP conn
        │     DATA / HALF_CLOSE / RESET           │  (opened by the agent on demand)
@@ -88,7 +98,7 @@ external host (behind NAT)                cloud (Kubernetes)
 
 One TCP connection, many HTTP/2 streams. The agent opens the `Control` stream once after connecting; the controller pushes commands down its response direction. Each forwarded public connection gets its own `Forward` stream so gRPC's per-stream flow control gives natural backpressure.
 
-> **What is implemented today:** the mTLS dial, the `Control` stream and `Hello` / `Heartbeat` exchange; the generic `AgentRequest`/`AgentResult` dispatch envelope with the Docker **images** endpoints — `GET` (list), `POST` (pull, streaming SSE progress), and `DELETE` (remove) on `/api/v1/agents/<id>/images`; the agent **working-directory filesystem** API (`GET`/`POST`/`PUT`/`DELETE /api/v1/agents/<id>/files`); the **metrics aggregation** endpoint (`GET /api/v1/metrics`) that reverse-pulls, labels, and merges each agent's configured exporters; the Redis `agent→pod` registry; and cross-pod relay of API requests via `ControllerPeer.Dispatch` (unary), `ControllerPeer.DispatchStream` (streaming), and `ControllerPeer.Upload` (client-streaming, for filesystem writes). `Forward`, `DockerOp` execution, and the cross-pod port-forward data plane are stubs or unimplemented. See [Roadmap](#roadmap).
+> **What is implemented today:** the mTLS dial, the `Control` stream and `Hello` / `Heartbeat` exchange; the generic `AgentRequest`/`AgentResult` dispatch envelope with the Docker **images** endpoints — `GET` (list), `POST` (pull, streaming SSE progress), and `DELETE` (remove) on `/api/v1/agents/<id>/images`; the Docker **containers** endpoints on `/api/v1/agents/<id>/containers` — list, create-and-start (docker run semantics), inspect, start/stop/restart, remove, and an SSE **log stream** (`.../logs`, `?follow` supported, client disconnect cancels the agent-side stream via `request.cancel`); the agent **working-directory filesystem** API (`GET`/`POST`/`PUT`/`DELETE /api/v1/agents/<id>/files`); the **metrics aggregation** endpoint (`GET /api/v1/metrics`) that reverse-pulls, labels, and merges each agent's configured exporters; the Redis `agent→pod` registry; and cross-pod relay of API requests via `ControllerPeer.Dispatch` (unary), `ControllerPeer.DispatchStream` (streaming), and `ControllerPeer.Upload` (client-streaming, for filesystem writes). `Forward`, Docker **event** reporting, and the cross-pod port-forward data plane are stubs or unimplemented. See [Roadmap](#roadmap).
 
 ---
 
@@ -108,7 +118,9 @@ The agent is the gRPC **client**; the controller has the public entrypoint and i
 
 ### Command Channel
 
-On connect, the agent opens `Control(stream AgentEvent) returns (stream Command)`. The controller pushes `OpenForward`, `DockerOp` (run / stop / start / pause / unpause / rm), and `ExposeRule` down the `Command` stream. The agent reports its handshake, heartbeats, and Docker events up the `AgentEvent` stream.
+On connect, the agent opens `Control(stream AgentEvent) returns (stream Command)`. The controller pushes commands down the `Command` stream; the agent reports its handshake, heartbeats, and Docker events up the `AgentEvent` stream.
+
+Most controller→agent work rides the generic **`AgentRequest`** envelope: `method` names the operation (`images.*`, `containers.*`, `fs.*`, `metrics.scrape`), `payload` is method-specific JSON, and the reply (`AgentResult`, plus `AgentProgress` frames for streaming methods) is correlated by `request_id`. A fire-and-forget `request.cancel` meta method cancels an in-flight streaming request — this is what tears down a followed log stream when its HTTP client goes away. Container lifecycle is implemented through this plane (the `containers.*` methods); the `DockerOp` command in the proto is an unused legacy placeholder. `OpenForward` and `ExposeRule` (port forwarding) are designed but not implemented.
 
 ### Metrics: two endpoints, two concerns
 
@@ -128,6 +140,14 @@ On a scrape of `/api/v1/metrics`, the controller:
 > **Constraint:** **never string-concatenate expositions.** Duplicate HELP/TYPE lines for the same metric name make the Prometheus parser reject the entire payload. Merge at the `MetricFamily` level.
 
 > The `exporter` label (not `job` / `instance`) is used deliberately so the injected labels survive **without** requiring `honor_labels` in the Prometheus scrape config. Exporters run as **separate sidecar binaries**; the agent GETs them locally (e.g. `127.0.0.1:9100`). Do **not** import node_exporter as a library — its collector package is not a stable public API.
+
+### Container Logs
+
+`GET /api/v1/agents/<id>/containers/<containerId>/logs` streams a container's logs as **SSE**: one `data:` event per log line (`{"stream":"stdout"|"stderr","line":"..."}`), terminated by `{"done":true,...}`. Query parameters mirror `docker logs`: `follow` keeps the stream open for new output, `tail` bounds the initial backlog, `since` bounds the start time, `timestamps` prefixes each line. The agent inspects the container's TTY mode to pick the right wire format (raw vs `stdcopy`-multiplexed), demuxes stdout/stderr, and emits line-framed `AgentProgress` events over the **lossless** stream class (no dropped lines, backpressure applies).
+
+A followed stream is unbounded, so teardown is explicit: when the HTTP client disconnects (or the request is otherwise abandoned), the controller sends a fire-and-forget `request.cancel` down the agent's `Control` stream, and the agent cancels the underlying `docker logs` follow. This propagates across pods — cancelling the `ControllerPeer.DispatchStream` relay makes the holding pod issue the cancel.
+
+> **Log collection into Loki (decided, not yet implemented).** Agent hosts sit on a **restricted network whose only permitted path is the agent→controller mTLS connection**, so per-host shippers (Alloy/promtail pushing to Loki directly) are not an option. The decided design relays logs through the controller: a controller-side log-relay follows `containers.logs` for the containers of each agent it holds, stamps `{agent_id, container_name}` labels, and pushes lines to the in-cluster Alloy `loki.source.api` endpoint (Alloy owns batching/retry/relabel into Loki). Open points: resume via `since` after reconnect, relay ownership following agent reconnects across replicas, and bandwidth budgeting on the shared Control stream. See [Roadmap](#roadmap).
 
 ### Port Forwarding
 
@@ -173,7 +193,7 @@ Exposure rules are tied to lifecycle via `client.Events()`:
 
 ## Wire Protocol
 
-The services are defined in `pkg/api/hostlink/v1/`. `AgentLink` (agent↔controller) has two bidirectional-stream RPCs; `ControllerPeer` (controller↔controller) has one unary RPC:
+The services are defined in `pkg/api/hostlink/v1/`. `AgentLink` (agent↔controller) has two bidirectional-stream RPCs; `ControllerPeer` (controller↔controller) has three relay RPCs (unary, server-streaming, and client-streaming):
 
 ```proto
 service AgentLink {
@@ -194,10 +214,14 @@ service ControllerPeer {
   // holder rejects with FAILED_PRECONDITION so the caller re-resolves and retries.
   rpc Dispatch(DispatchRequest) returns (AgentResult);
 
-  // Streaming variant for long-running ops (e.g. image pull): each streamed
-  // AgentResult is a progress frame except the last, which has final=true and
-  // carries the terminal code/payload/error.
+  // Streaming variant for long-running ops (e.g. image pull, container logs):
+  // each streamed AgentResult is a progress frame except the last, which has
+  // final=true and carries the terminal code/payload/error.
   rpc DispatchStream(DispatchRequest) returns (stream AgentResult);
+
+  // Client-streaming relay of a controller->agent upload (e.g. fs.write): the
+  // first UploadFrame carries the open (DispatchRequest), the rest body chunks.
+  rpc Upload(stream UploadFrame) returns (AgentResult);
 }
 ```
 
@@ -225,6 +249,14 @@ The controller serves a small REST surface on its in-cluster default listener, o
 | `POST /api/v1/agents/<agentId>/images` | Pull a Docker image on the agent. JSON body `{"image":"<ref>","auth":{...optional registry auth...}}`. Responds with a **`text/event-stream`** (SSE): each event is `data: <PullProgress JSON>` (`id`/`status`/`current`/`total`/`progress`), terminated by `data: {"done":true,"code":...,"error":...}`. Dispatches the streaming `images.pull` (locally, or relayed via `ControllerPeer.DispatchStream`); no dispatch timeout (large pulls take minutes). 404 if the agent is unreachable. |
 | `DELETE /api/v1/agents/<agentId>/images/<imageId>` | Remove a single image by ID (path param; works for an image ID or a digest, which contain no `/`). Optional `?force=true` and `?noPrune=true`. Dispatches `images.remove`; returns a `RemoveResult` JSON `{"deleted":[...],"errors":[...]}` (partial failures are reported, not fatal). |
 | `DELETE /api/v1/agents/<agentId>/images?ref=A&ref=B` | Remove multiple images by repeated `ref` query params (use this form for full `repo/path:tag` references, which contain `/` and cannot be a path segment). Same options/response as the single-image form. |
+| `GET /api/v1/agents/<agentId>/containers` | List the containers on the agent (`containers.list`). `?all=true` includes stopped containers (docker ps -a). |
+| `POST /api/v1/agents/<agentId>/containers` | Create **and start** a container (docker run semantics, `containers.create`). JSON body: `image` (required, must already be pulled), plus optional `name`, `cmd`, `entrypoint`, `env` (`KEY=value` strings), `workingDir`, `labels`, `ports` (`{containerPort, protocol?, hostIp?, hostPort?}`), `binds` (`/host:/container[:opts]`), `networkMode` / `pidMode` (e.g. `"host"`), `restartPolicy` (+ `maxRetryCount`), `autoRemove`. Returns `201` with `{"id":"...","warnings":[...]}`. |
+| `GET /api/v1/agents/<agentId>/containers/<containerId>` | Inspect a container (`containers.inspect`): identity, state, and the effective run configuration. `404` for an unknown container. |
+| `GET /api/v1/agents/<agentId>/containers/<containerId>/logs` | Stream the container's logs as **SSE** (`containers.logs`): one event per line `{"stream","line"}`, terminated by `{"done":true,...}`. Options mirror docker logs: `?follow=true`, `?tail=100`, `?since=<RFC3339|unix>`, `?timestamps=true`. Client disconnect cancels the agent-side stream (`request.cancel`), including across pods. |
+| `POST /api/v1/agents/<agentId>/containers/<containerId>/start` | Start a stopped container (`containers.start`). `204` on success. |
+| `POST /api/v1/agents/<agentId>/containers/<containerId>/stop` | Stop a running container (`containers.stop`). Optional `?timeout=<seconds>` grace period before the daemon kills it. `204` on success. |
+| `POST /api/v1/agents/<agentId>/containers/<containerId>/restart` | Restart a container (`containers.restart`), same `?timeout` as stop. `204` on success. |
+| `DELETE /api/v1/agents/<agentId>/containers/<containerId>` | Remove a container (`containers.remove`). `?force=true` removes a running one (docker rm -f), `?volumes=true` also removes its anonymous volumes. `409` when removing a running container without `force`. |
 | `GET /api/v1/agents/<agentId>/files?path=<p>` | Browse the agent's working directory (`--data-dir`). A directory returns JSON `{"entries":[{"name","dir","size","modTime"}]}` (non-recursive); a file is **streamed as a download** (`Content-Disposition`), or with `Accept: application/json` returns its `FsEntry` metadata. Empty `path` is the working-dir root. Dispatches `fs.stat` then `fs.list` / `fs.read`. |
 | `POST /api/v1/agents/<agentId>/files?path=<p>` | `&dir=true` creates a directory (`fs.mkdir`, `409` if it exists). Otherwise uploads one or more files from a **multipart form**, streamed to the agent in chunks (`fs.write`) and created **exclusively** — an existing target is reported per-file. Response `{"written":[...],"errors":[...]}`. |
 | `PUT /api/v1/agents/<agentId>/files?path=<p>` | Overwrite a single file with the request body (raw bytes, or the first multipart part); streamed via `fs.write` (truncate). |
@@ -255,11 +287,11 @@ This project is **Linux-only** (it manages a Linux Docker daemon and uses Linux-
 The project is a single Go module with one binary per `cmd/` subdirectory, and it is **vendored** — build offline with `-mod=vendor`:
 
 ```bash
-go build -mod=vendor -o bin/hostlink-controller ./cmd/controller
-go build -mod=vendor -o bin/hostlink      ./cmd/agent
+go build -mod=vendor -o bin/controller/hostlink ./cmd/controller
+go build -mod=vendor -o bin/agent/hostlink      ./cmd/agent
 ```
 
-> The agent is the only hostlink binary installed on a host, so it is named simply `hostlink`; the cloud-side control plane keeps the `hostlink-controller` name.
+> Both binaries are named `hostlink` (separate output directories keep local builds apart); in production the controller ships as the `hostlink` container image (`make build`) and the agent as the `hostlink` host binary (`make agent`).
 
 On a Windows dev machine, compile inside a Linux container (the working tree and Go caches are bind-mounted, the container provides the Linux toolchain):
 
@@ -287,17 +319,20 @@ The controller requires-and-verifies the agent client certificate (`RequireAndVe
 
 ## CLI Flags
 
-All flags can also be set via environment variables: uppercase the flag, replace `-` with `_`, and prefix with `HM_` (e.g. `--controller-endpoint` → `HM_CONTROLLER_ENDPOINT`). Config may also be supplied as a YAML file at `/etc/humble-mun/<binary>.yaml` (`hostlink.yaml` or `controller.yaml`, after the binary's `version.Name`), with the flag names as keys; the file is watched and reloaded at runtime. Precedence: flags > env > config file.
+All flags can also be set via environment variables: uppercase the flag, replace `-` with `_`, and prefix with `HM_` (e.g. `--controller-endpoint` → `HM_CONTROLLER_ENDPOINT`). Config may also be supplied as a YAML file at `/etc/humble-mun/hostlink.yaml` (the name follows the binary's `version.Name`, which is `hostlink` for both the controller and the agent), with the flag names as keys; the file is watched and reloaded at runtime. Precedence: flags > env > config file.
 
 ### Agent flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--controller-endpoint` | — | Address of the `hostlink-controller` gRPC endpoint to dial, as `host:port` (required) |
+| `--controller-endpoint` | — | Address of the controller's gRPC endpoint to dial, as `host:port` (required) |
 | `--agent-tls-cert-path` | — | Client certificate the agent presents to the controller for mTLS |
 | `--agent-tls-key-path` | — | Private key matching the client certificate |
 | `--controller-tls-ca-path` | — | CA bundle used to verify the controller's certificate |
 | `--controller-tls-server-name` | — | Server name to verify against the controller's certificate; if empty, gRPC verifies against the dial endpoint's host, so set it explicitly when the cert SAN differs from the dial address |
+| `--data-dir` | — | Working directory served by the `files` API (browse/download/upload/delete). Empty disables the `files` API |
+
+> `scrape-targets` (the agent's upstream exporter list for the metrics fan-out) is a structured YAML list and is configured via the config file only — see `deploy/hostlink.yaml` for the documented shape.
 
 ### Controller flags
 
@@ -312,6 +347,8 @@ All flags can also be set via environment variables: uppercase the flag, replace
 | `--peer-advertise-address` | — | Address siblings dial to reach this pod's peer listener (written as the registry value); required in cross-pod mode |
 | `--peer-tls-cert-path` / `--peer-tls-key-path` / `--peer-tls-ca-path` | — | mTLS material for the ControllerPeer plane (controller is both server and client) |
 | `--peer-tls-server-name` | — | Server name to verify a sibling against when relaying; empty = the dialed peer host |
+| `--agent-scrape-timeout` | `5s` | Per-agent deadline for the `GET /api/v1/metrics` fan-out; keep it below the Prometheus `scrape_timeout` |
+| `--grpc-max-recv-msg-size` | 16 MiB | Ceiling for a single gRPC message received from an agent or sibling (large unary results; streaming methods chunk and are unaffected) |
 
 > `--redis-url` and `--peer-bind-address` are the two halves of one cross-pod switch: set both (plus `--peer-advertise-address`) or neither. The controller refuses to start half-configured.
 
@@ -321,9 +358,9 @@ The controller also inherits the chassis HTTP server flags (`--http-bind-address
 
 ## Deployment Shape
 
-### hostlink-controller (cloud)
+### Controller (cloud; container image `hostlink`)
 
-- **Form:** a Kubernetes **StatefulSet** (chart default `replicaCount: 1`). The chart at `charts/hostlink/` (`helm install <release> charts/hostlink`) renders a ConfigMap holding `/etc/humble-mun/controller.yaml`, the StatefulSet, a load-balanced ClusterIP Service (gRPC + in-cluster HTTP ports), a **headless `<release>-peer` Service** for stable per-pod DNS, and — when `ingress.host` is set — the agent-facing gRPC Ingress. **For HA, set `replicaCount > 1`, which requires `redis.url` + `peer.enabled`** (the chart fails the install otherwise — a half-configured multi-replica controller would silently 404 for agents held by sibling pods).
+- **Form:** a Kubernetes **StatefulSet** (chart default `replicaCount: 1`). The chart at `charts/hostlink/` (`helm install <release> charts/hostlink`) renders a ConfigMap holding `/etc/humble-mun/hostlink.yaml`, the StatefulSet, a load-balanced ClusterIP Service (gRPC + in-cluster HTTP ports), a **headless `<release>-peer` Service** for stable per-pod DNS, and — when `ingress.host` is set — the agent-facing gRPC Ingress. **For HA, set `replicaCount > 1`, which requires `redis.url` + `peer.enabled`** (the chart fails the install otherwise — a half-configured multi-replica controller would silently 404 for agents held by sibling pods).
 - **Three listeners** (the chassis HTTP/2 server multiplexes gRPC and Gin onto each listener — `Content-Type: application/grpc` with HTTP/2 routes to the gRPC server, everything else to Gin):
   1. an **mTLS gRPC listener** (`--grpc-bind-address` + `WithTLSCert` + `WithMTLS`) that agents dial out to; exposed externally through the ingress.
   2. a **plaintext (h2c) default listener**, bound in-cluster only, serving the REST API (`/api/v1/...`, including the aggregated agent metrics at `/api/v1/metrics`), the controller's own `/metrics`, `/probe`, `/version`, `/logging`.
@@ -349,11 +386,11 @@ The controller exposes **two** scrape paths on the in-cluster HTTP Service (`htt
 
 Keep the Prometheus job's `scrape_timeout` **above** the controller's `--agent-scrape-timeout` (default 5s) so the fan-out's per-agent deadline fires first. The `/api/v1/metrics` series already carry `agent`/`exporter` labels, so `honor_labels` is not required.
 
-### hostlink (external host)
+### Agent (external host; binary `hostlink`)
 
 - **Form:** a static Go binary (`/usr/local/bin/hostlink`) running as a **systemd service**. The unit and an example config ship in `deploy/` (`deploy/hostlink.service`, `deploy/hostlink.yaml`).
 - **Configuration:** the agent reads all settings from `/etc/humble-mun/hostlink.yaml` (chassis viper `SetConfigName("hostlink")` + `AddConfigPath("/etc/humble-mun")`; YAML keys are the flag names verbatim, each overridable by an `HM_*` env var). The systemd unit passes **no** command-line flags, and viper `WatchConfig` reloads the file at runtime, so changing config needs neither `systemctl daemon-reload` nor a unit edit.
-- **Behavior:** dials out to the controller's public gRPC endpoint over mTLS and runs the `Control` stream (`Hello` + periodic `Heartbeat`), reconnecting **in-process** with exponential backoff + jitter (and HTTP/2 keepalive) so a controller redeploy is ridden out without a process restart. It serves controller-pushed `AgentRequest`s: the Docker **images** methods (`images.list` / `images.pull` / `images.remove`, via a lazy `client.FromEnv` Docker client) and the **filesystem** methods (`fs.stat` / `fs.list` / `fs.read` / `fs.write` / `fs.mkdir` / `fs.remove`) over the configured `--data-dir` working directory. Container *lifecycle* ops (`DockerOp`/events), carrying tunnels, and the node_exporter sidecar on `127.0.0.1:9100` are planned (see [Roadmap](#roadmap)). Because the Docker client is lazy, the unit treats `docker.service` as a soft (`Wants`) ordering dependency, not a hard requirement.
+- **Behavior:** dials out to the controller's public gRPC endpoint over mTLS and runs the `Control` stream (`Hello` + periodic `Heartbeat`), reconnecting **in-process** with exponential backoff + jitter (and HTTP/2 keepalive) so a controller redeploy is ridden out without a process restart. It serves controller-pushed `AgentRequest`s via a lazy `client.FromEnv` Docker client: the Docker **images** methods (`images.list` / `images.pull` / `images.remove`), the **container** methods (`containers.list` / `containers.create` / `containers.inspect` / `containers.start` / `containers.stop` / `containers.restart` / `containers.remove` / `containers.logs`), and the **filesystem** methods (`fs.stat` / `fs.list` / `fs.read` / `fs.write` / `fs.mkdir` / `fs.remove`) over the configured `--data-dir` working directory. Docker *event* reporting, carrying tunnels, and the node_exporter sidecar on `127.0.0.1:9100` are planned (see [Roadmap](#roadmap)). Because the Docker client is lazy, the unit treats `docker.service` as a soft (`Wants`) ordering dependency, not a hard requirement.
 - **Network:** behind NAT; only needs **outbound** reachability to the controller.
 
 ---
@@ -405,10 +442,13 @@ Items below are **non-negotiable** — do not deviate during implementation.
 - [x] Redis `agent→pod` registry (write/CAD-delete/TTL-refresh; standalone/sentinel/cluster topologies) and cross-pod relay of API requests via `ControllerPeer.Dispatch` + `ControllerPeer.DispatchStream`, with reject-and-retry on a stale mapping
 - [x] Helm chart: StatefulSet + headless peer Service; optional Redis, peer plane, and cert-manager CSI cert issuance; multi-replica config guard
 - [x] Metrics aggregation: agent `scrape-targets` (node_exporter / dcgm / …) pulled on demand and **streamed** back; controller `GET /api/v1/metrics` bounded-concurrency reverse fan-out + `agent`/`exporter` label injection + `MetricFamily` merge + synthesized `agent_up` / `hostlink_scrape_target_up`, cross-pod aware via `ControllerPeer.DispatchStream`
+- [x] Container CRUD + lifecycle on `/api/v1/agents/<id>/containers` (`containers.list` / `containers.create` with docker run semantics incl. ports, binds, `--net`/`--pid` host modes, restart policy / `containers.inspect` / `containers.start` / `containers.stop` / `containers.restart` / `containers.remove`)
+- [x] Container **log streaming** (`.../containers/<id>/logs`, SSE, `?follow`/`?tail`/`?since`/`?timestamps`): TTY-aware stdout/stderr demux, line framing, lossless delivery; plus the `request.cancel` meta method so an abandoned followed stream is torn down on the agent, propagated across pods
 
 ### In Progress / Planned (MVP)
 
-- [ ] Container lifecycle ops: `DockerOp` (run/stop/start/rm) execution; `DockerEvent` reporting
+- [ ] Docker **event** reporting (`DockerEvent`: container start/stop/die driving exposure lifecycle)
+- [ ] Controller-side **log relay into Loki** ("Plan B" — agents can only reach the controller, so a relay follows `containers.logs` per held agent, labels `{agent_id, container_name}`, and pushes to in-cluster Alloy `loki.source.api`; needs `since`-based resume, ownership follow-on-reconnect, and Control-stream bandwidth budgeting)
 - [ ] Port forwarding: integrate `openconfig/grpctunnel` (verify half-close first); `ExposeRule` / `OpenForward`; `Frame` relay with half-close + backpressure (`Forward` is currently a stub)
 - [ ] Multi-replica **port forwarding**: the `port:<P>` map + atomic port-pool allocation, and the cross-pod two-hop relay of the port-forward data plane (the API-request relay already exists)
 - [ ] Lifecycle coupling: Docker events drive exposure establish / suspend / re-establish

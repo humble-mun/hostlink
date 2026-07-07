@@ -1,14 +1,14 @@
 .DEFAULT_GOAL := build
 .PHONY: tag controller agent build clean push proto
 
-BASE_IMAGE ?= gcr.io/distroless/base-debian13:latest
+BASE_IMAGE ?= gcr.io/distroless/static-debian13:latest
 ARCH ?= amd64
 VARIANT ?=
-VERSION ?= v1.0
+VERSION ?= v0.1.0
 TIMESTAMP := $(shell date '+%Y%m%d%H%M')
 TAG ?= $(VERSION)$(shell test "$(ARCH)" != amd64 && echo "-$(ARCH)" || true)$(shell test ! -z $(VARIANT) && echo "-$(VARIANT)" || true)-$(TIMESTAMP)
 DEBUG ?= false
-REPO ?= harbor-c0a811fc.nip.io/humble-mun/hostlink-controller
+REPO ?= harbor-c0a811fc.nip.io/humble-mun/hostlink
 DOCKERFILE ?= Dockerfile
 GO_VERSION ?= 1.26.4-trixie
 BASE_PROJECT ?= github.com/humble-mun/chassis

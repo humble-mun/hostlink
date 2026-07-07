@@ -58,6 +58,57 @@ const (
 	// yields code 404.
 	MethodFsRemove = "fs.remove"
 
+	// MethodContainersList lists the Docker containers on the agent host. Its
+	// request payload is a ContainerListRequest (an empty payload lists running
+	// containers only); the result payload is a JSON array of ContainerSummary.
+	MethodContainersList = "containers.list"
+
+	// MethodContainersCreate creates and starts a container on the agent host
+	// (docker run semantics). Its request payload is a ContainerCreateRequest;
+	// the result payload is a ContainerCreateResult with code 201. When the
+	// container was created but failed to start, the error message names the
+	// container ID so the caller can inspect or remove it.
+	MethodContainersCreate = "containers.create"
+
+	// MethodContainersInspect reports the details of a single container. Its
+	// request payload is a ContainerIDRequest; the result payload is a
+	// ContainerDetail. An unknown container yields code 404.
+	MethodContainersInspect = "containers.inspect"
+
+	// MethodContainersStart starts a stopped container. Its request payload is a
+	// ContainerIDRequest; the result payload is empty (code 204 on success).
+	MethodContainersStart = "containers.start"
+
+	// MethodContainersStop stops a running container. Its request payload is a
+	// ContainerStopRequest; the result payload is empty (code 204 on success).
+	MethodContainersStop = "containers.stop"
+
+	// MethodContainersRestart restarts a container. Its request payload is a
+	// ContainerStopRequest; the result payload is empty (code 204 on success).
+	MethodContainersRestart = "containers.restart"
+
+	// MethodContainersRemove removes a container (docker rm). Its request payload
+	// is a ContainerRemoveRequest; the result payload is empty (code 204 on
+	// success). Removing a running container without Force yields code 409.
+	MethodContainersRemove = "containers.remove"
+
+	// MethodContainersLogs streams a container's logs (docker logs). Its request
+	// payload is a ContainerLogsRequest. It is a streaming method: each log line
+	// is delivered as an AgentProgress frame carrying a LogFrame, followed by a
+	// terminal AgentResult. With Follow set the stream runs until the container
+	// stops producing forever or the controller cancels the request via
+	// MethodRequestCancel.
+	MethodContainersLogs = "containers.logs"
+
+	// MethodRequestCancel asks the agent to cancel an in-flight streaming request
+	// named by the CancelRequest payload. It is fire-and-forget: the agent sends
+	// no result for the cancel itself (the cancelled request still terminates
+	// with its own final AgentResult), and an unknown request_id is ignored
+	// because the request already finished. It exists for unbounded streams
+	// (a followed containers.logs) whose consumer went away: without it the
+	// agent would keep producing frames forever.
+	MethodRequestCancel = "request.cancel"
+
 	// MethodMetricsScrape pulls the agent's configured upstream exporters (e.g.
 	// node_exporter, dcgm-exporter) and streams their raw Prometheus exposition to
 	// the controller. It takes no request payload. It is a streaming method: each
@@ -186,4 +237,170 @@ type DeletedImage struct {
 type RemoveError struct {
 	Ref   string `json:"ref"`
 	Error string `json:"error"`
+}
+
+// ContainerListRequest is the MethodContainersList request payload. All includes
+// stopped containers (docker ps -a); when false only running containers are
+// listed.
+type ContainerListRequest struct {
+	All bool `json:"all,omitempty"`
+}
+
+// ContainerPort is one port mapping of a container: PrivatePort/Protocol name
+// the container-side port; IP/PublicPort carry the host-side binding when the
+// port is published.
+type ContainerPort struct {
+	IP          string `json:"ip,omitempty"`
+	PrivatePort uint16 `json:"privatePort"`
+	PublicPort  uint16 `json:"publicPort,omitempty"`
+	Protocol    string `json:"protocol"`
+}
+
+// ContainerSummary is one entry of the MethodContainersList result. It mirrors
+// the relevant fields of the Docker container summary, projected to a stable
+// JSON shape the REST layer returns unchanged.
+type ContainerSummary struct {
+	ID      string            `json:"id"`
+	Names   []string          `json:"names"`
+	Image   string            `json:"image"`
+	ImageID string            `json:"imageId"`
+	Command string            `json:"command"`
+	Created int64             `json:"created"`
+	Ports   []ContainerPort   `json:"ports,omitempty"`
+	Labels  map[string]string `json:"labels,omitempty"`
+	State   string            `json:"state"`
+	Status  string            `json:"status"`
+}
+
+// PortBinding is one published port in a ContainerCreateRequest (docker run -p).
+// ContainerPort is the container-side port ("80" or a range "8000-8010");
+// Protocol defaults to "tcp". HostIP/HostPort are optional: with both empty the
+// port is only exposed, and an empty HostPort lets the daemon pick an ephemeral
+// port.
+type PortBinding struct {
+	ContainerPort string `json:"containerPort"`
+	Protocol      string `json:"protocol,omitempty"`
+	HostIP        string `json:"hostIp,omitempty"`
+	HostPort      string `json:"hostPort,omitempty"`
+}
+
+// ContainerCreateRequest is the MethodContainersCreate request payload. It
+// projects the docker run options the API supports: Image is required, Env
+// entries are "KEY=value" pairs, Binds are host mounts in Docker bind syntax
+// ("/host:/container[:ro]"), and RestartPolicy is one of the Docker restart
+// modes ("no", "always", "on-failure", "unless-stopped") with MaxRetryCount
+// applying to "on-failure" only. AutoRemove maps to docker run --rm.
+// NetworkMode and PidMode mirror docker run --net and --pid (e.g. "host");
+// with NetworkMode "host" any Ports entries are ignored by the daemon.
+type ContainerCreateRequest struct {
+	Name          string            `json:"name,omitempty"`
+	Image         string            `json:"image"`
+	Cmd           []string          `json:"cmd,omitempty"`
+	Entrypoint    []string          `json:"entrypoint,omitempty"`
+	Env           []string          `json:"env,omitempty"`
+	WorkingDir    string            `json:"workingDir,omitempty"`
+	Labels        map[string]string `json:"labels,omitempty"`
+	Ports         []PortBinding     `json:"ports,omitempty"`
+	Binds         []string          `json:"binds,omitempty"`
+	NetworkMode   string            `json:"networkMode,omitempty"`
+	PidMode       string            `json:"pidMode,omitempty"`
+	RestartPolicy string            `json:"restartPolicy,omitempty"`
+	MaxRetryCount int               `json:"maxRetryCount,omitempty"`
+	AutoRemove    bool              `json:"autoRemove,omitempty"`
+}
+
+// ContainerCreateResult is the MethodContainersCreate result payload: the ID of
+// the created (and started) container plus any warnings the daemon reported.
+type ContainerCreateResult struct {
+	ID       string   `json:"id"`
+	Warnings []string `json:"warnings,omitempty"`
+}
+
+// ContainerIDRequest is the request payload for the container methods addressed
+// by ID or name only (inspect, start).
+type ContainerIDRequest struct {
+	ID string `json:"id"`
+}
+
+// ContainerStopRequest is the MethodContainersStop/MethodContainersRestart
+// request payload. Timeout is the grace period in seconds before the daemon
+// kills the container; nil uses the daemon default.
+type ContainerStopRequest struct {
+	ID      string `json:"id"`
+	Timeout *int   `json:"timeout,omitempty"`
+}
+
+// ContainerRemoveRequest is the MethodContainersRemove request payload. Force
+// removes a running container (docker rm -f); RemoveVolumes also removes the
+// anonymous volumes associated with the container (docker rm -v).
+type ContainerRemoveRequest struct {
+	ID            string `json:"id"`
+	Force         bool   `json:"force,omitempty"`
+	RemoveVolumes bool   `json:"removeVolumes,omitempty"`
+}
+
+// CancelRequest is the MethodRequestCancel request payload: the request_id of
+// the in-flight streaming request to cancel.
+type CancelRequest struct {
+	RequestID string `json:"requestId"`
+}
+
+// ContainerLogsRequest is the MethodContainersLogs request payload, mirroring
+// the docker logs options: Follow keeps the stream open for new output, Tail
+// limits the initial backlog (a line count or "all"), Since bounds the start
+// time (RFC3339 or a unix timestamp), and Timestamps prefixes each line with
+// its time.
+type ContainerLogsRequest struct {
+	ID         string `json:"id"`
+	Follow     bool   `json:"follow,omitempty"`
+	Tail       string `json:"tail,omitempty"`
+	Since      string `json:"since,omitempty"`
+	Timestamps bool   `json:"timestamps,omitempty"`
+}
+
+// LogFrame is one AgentProgress frame of a MethodContainersLogs operation: a
+// single log line and the channel ("stdout" or "stderr") it was written to.
+// For a TTY container the two channels are merged and every line reports
+// "stdout".
+type LogFrame struct {
+	Stream string `json:"stream"`
+	Line   string `json:"line"`
+}
+
+// ContainerState is the state block of a ContainerDetail, mirroring the Docker
+// inspect state fields.
+type ContainerState struct {
+	Status     string `json:"status"`
+	Running    bool   `json:"running"`
+	Paused     bool   `json:"paused,omitempty"`
+	Restarting bool   `json:"restarting,omitempty"`
+	OOMKilled  bool   `json:"oomKilled,omitempty"`
+	Dead       bool   `json:"dead,omitempty"`
+	Pid        int    `json:"pid,omitempty"`
+	ExitCode   int    `json:"exitCode"`
+	Error      string `json:"error,omitempty"`
+	StartedAt  string `json:"startedAt,omitempty"`
+	FinishedAt string `json:"finishedAt,omitempty"`
+}
+
+// ContainerDetail is the MethodContainersInspect result payload: the container's
+// identity, state, and the effective run configuration, projected from the
+// Docker inspect response to a stable JSON shape.
+type ContainerDetail struct {
+	ID            string            `json:"id"`
+	Name          string            `json:"name"`
+	Image         string            `json:"image"`
+	ImageID       string            `json:"imageId"`
+	Created       string            `json:"created"`
+	State         ContainerState    `json:"state"`
+	RestartCount  int               `json:"restartCount"`
+	Cmd           []string          `json:"cmd,omitempty"`
+	Entrypoint    []string          `json:"entrypoint,omitempty"`
+	Env           []string          `json:"env,omitempty"`
+	WorkingDir    string            `json:"workingDir,omitempty"`
+	Labels        map[string]string `json:"labels,omitempty"`
+	Ports         []ContainerPort   `json:"ports,omitempty"`
+	Binds         []string          `json:"binds,omitempty"`
+	RestartPolicy string            `json:"restartPolicy,omitempty"`
+	AutoRemove    bool              `json:"autoRemove,omitempty"`
 }

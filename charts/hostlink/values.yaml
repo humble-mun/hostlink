@@ -1,7 +1,7 @@
 # ---------------------------------------------------------------------------
 # Image
 # ---------------------------------------------------------------------------
-image: harbor-c0a811fc.nip.io/humble-mun/hostlink-controller:v0.1.0
+image: harbor-c0a811fc.nip.io/humble-mun/hostlink:v0.1.0
 
 # replicaCount is the number of controller pods, running as a StatefulSet so each
 # pod gets a stable ordinal name + per-pod DNS via the headless Service. Default 1

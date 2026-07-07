@@ -15,7 +15,7 @@
 # Controller connection
 # --------------------------------------------------------------------------
 
-# Address of the hostlink-controller gRPC endpoint to dial, as host:port.
+# Address of the controller gRPC endpoint to dial, as host:port.
 # REQUIRED — the agent exits immediately if this is empty.
 controller-endpoint: "controller.example.com:8443"
 

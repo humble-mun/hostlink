@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -248,10 +249,11 @@ func (r *streamReg) close() {
 }
 
 // streamReliable reports whether a streaming method requires lossless delivery.
-// File reads and metrics scrapes carry bytes that must never be dropped; progress
-// streams (images.pull) are advisory and may drop frames under a slow consumer.
+// File reads, metrics scrapes, and container logs carry data that must never be
+// dropped; progress streams (images.pull) are advisory and may drop frames
+// under a slow consumer.
 func streamReliable(method string) bool {
-	return method == agentapi.MethodFsRead || method == agentapi.MethodMetricsScrape
+	return method == agentapi.MethodFsRead || method == agentapi.MethodMetricsScrape || method == agentapi.MethodContainersLogs
 }
 
 func newAgentConn(agentID string, stream grpc.BidiStreamingServer[hostlinkv1.AgentEvent, hostlinkv1.Command], logger logr.Logger) *agentConn {
@@ -334,11 +336,37 @@ func (c *agentConn) dispatchStream(_ context.Context, method string, payload []b
 
 	cancel = func() {
 		c.mu.Lock()
-		if c.pendingStream[requestID] == reg {
+		live := c.pendingStream[requestID] == reg
+		if live {
 			delete(c.pendingStream, requestID)
 		}
+		closed := c.closed
 		c.mu.Unlock()
 		reg.close()
+		if !live || closed {
+			return
+		}
+		// The stream had not reached its terminal frame, so the agent is still
+		// producing: tell it to stop. This is what ends an unbounded stream (a
+		// followed containers.logs) whose consumer went away; for a finite stream
+		// cancelled mid-flight it stops wasted work. Best-effort: the agent
+		// ignores an unknown request_id, and a send failure means the Control
+		// stream is going down anyway.
+		payload, merr := json.Marshal(agentapi.CancelRequest{RequestID: requestID})
+		if merr != nil {
+			return
+		}
+		if serr := c.send(&hostlinkv1.Command{
+			Cmd: &hostlinkv1.Command_Request{
+				Request: &hostlinkv1.AgentRequest{
+					RequestId: strconv.FormatUint(c.seq.Add(1), 10),
+					Method:    agentapi.MethodRequestCancel,
+					Payload:   payload,
+				},
+			},
+		}); serr != nil {
+			c.logger.V(4).Info("send request.cancel to agent failed", "requestID", requestID, "reason", serr.Error())
+		}
 	}
 
 	if err = c.send(&hostlinkv1.Command{

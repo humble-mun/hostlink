@@ -19,7 +19,7 @@ func newRootCommand() *cobra.Command {
 		Use:   version.Name,
 		Short: "The hostlink agent runs on an external host to execute commands, report metrics, and carry tunnels.",
 		Long: "The hostlink agent is the host-side component of hostlink. It runs as a systemd service on a Linux " +
-			"host outside the cloud (behind NAT), dials out to the hostlink-controller over a persistent gRPC " +
+			"host outside the cloud (behind NAT), dials out to the hostlink controller over a persistent gRPC " +
 			"connection, manages local Docker containers, reports node metrics, and carries reverse TCP " +
 			"tunnels for dynamic port forwarding.",
 		FParseErrWhitelist: cobra.FParseErrWhitelist{

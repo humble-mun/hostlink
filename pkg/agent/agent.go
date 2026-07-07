@@ -52,7 +52,7 @@ const (
 
 // RegisterFlags registers the agent's controller-dial endpoint and mTLS flags.
 func RegisterFlags(pfs *pflag.FlagSet) {
-	pfs.String(flagControllerEndpoint, "", "address of the hostlink-controller gRPC endpoint to dial, as host:port")
+	pfs.String(flagControllerEndpoint, "", "address of the hostlink controller gRPC endpoint to dial, as host:port")
 	pfs.String(flagTLSCertPath, "", "The path to the client certificate the agent presents to the controller for mTLS.")
 	pfs.String(flagTLSKeyPath, "", "The path to the private key matching the client certificate.")
 	pfs.String(flagTLSCAPath, "", "The path to the CA bundle used to verify the controller's certificate.")
@@ -138,6 +138,7 @@ func New(logger logr.Logger, nodeName string) (ag Agent, err error) {
 		client:        hostlinkv1.NewAgentLinkClient(conn),
 		docker:        docker,
 		inbound:       make(map[string]*inboundStream),
+		cancels:       make(map[string]context.CancelFunc),
 	}
 	return ag, nil
 }
@@ -164,6 +165,14 @@ type agent struct {
 	// is never dropped for a missing channel.
 	inboundMu sync.Mutex
 	inbound   map[string]*inboundStream
+
+	// cancels holds the per-request context cancel of each in-flight streaming
+	// handler, keyed by request_id, so a controller request.cancel can stop it.
+	// An entry is registered synchronously in the receive loop (before the next
+	// command is read), so a cancel that follows the opening request can never
+	// miss it.
+	cancelMu sync.Mutex
+	cancels  map[string]context.CancelFunc
 }
 
 func (a *agent) Close() (err error) {
@@ -267,7 +276,7 @@ func (a *agent) runSession(ctx context.Context, logger logr.Logger) (connected b
 				err = fmt.Errorf("agent: send heartbeat: %w", err)
 				return
 			}
-			logger.Info("heartbeat sent")
+			logger.V(4).Info("heartbeat sent")
 		}
 	}
 }
@@ -350,17 +359,22 @@ func (a *agent) receiveCommands(ctx context.Context, logger logr.Logger) (err er
 }
 
 // startRequest dispatches an opening AgentRequest. Streaming methods run on their
-// own goroutine but must have their inbound plumbing registered synchronously
-// here (before the next command is read), so an early body chunk is never raced
-// against a missing channel; single-shot methods are simply handled off-loop.
+// own goroutine but must have their inbound plumbing (upload chunk channels,
+// cancel registrations) set up synchronously here (before the next command is
+// read), so an early body chunk or cancel is never raced against a missing
+// entry; single-shot methods are simply handled off-loop.
 func (a *agent) startRequest(ctx context.Context, req *hostlinkv1.AgentRequest, logger logr.Logger) {
 	switch req.GetMethod() {
+	case agentapi.MethodRequestCancel:
+		a.cancelInflight(req, logger)
 	case agentapi.MethodImagesPull:
-		go a.handlePull(ctx, req, logger)
+		a.startCancellable(ctx, req, func(ctx context.Context) { a.handlePull(ctx, req, logger) })
 	case agentapi.MethodFsRead:
-		go a.handleRead(ctx, req, logger)
+		a.startCancellable(ctx, req, func(ctx context.Context) { a.handleRead(ctx, req, logger) })
 	case agentapi.MethodMetricsScrape:
-		go a.handleScrape(ctx, req, logger)
+		a.startCancellable(ctx, req, func(ctx context.Context) { a.handleScrape(ctx, req, logger) })
+	case agentapi.MethodContainersLogs:
+		a.startCancellable(ctx, req, func(ctx context.Context) { a.handleLogs(ctx, req, logger) })
 	case agentapi.MethodFsWrite:
 		reg := a.registerInbound(req.GetRequestId())
 		go a.handleWrite(ctx, req, reg, logger)
@@ -369,11 +383,50 @@ func (a *agent) startRequest(ctx context.Context, req *hostlinkv1.AgentRequest, 
 	}
 }
 
+// startCancellable runs a streaming handler on its own goroutine under a
+// per-request cancel. The registration happens synchronously (before the
+// receive loop reads the next command) so a request.cancel arriving right
+// after the opening request always finds it.
+func (a *agent) startCancellable(ctx context.Context, req *hostlinkv1.AgentRequest, run func(context.Context)) {
+	reqCtx, cancel := context.WithCancel(ctx)
+	requestID := req.GetRequestId()
+	a.cancelMu.Lock()
+	a.cancels[requestID] = cancel
+	a.cancelMu.Unlock()
+	go func() {
+		defer func() {
+			a.cancelMu.Lock()
+			delete(a.cancels, requestID)
+			a.cancelMu.Unlock()
+			cancel()
+		}()
+		run(reqCtx)
+	}()
+}
+
+// cancelInflight handles a request.cancel command: it cancels the named
+// in-flight request's context and sends no reply. An unknown request_id means
+// the request already finished and is ignored. It runs synchronously in the
+// receive loop; it only flips a context, so it cannot stall the loop.
+func (a *agent) cancelInflight(req *hostlinkv1.AgentRequest, logger logr.Logger) {
+	var cr agentapi.CancelRequest
+	if err := json.Unmarshal(req.GetPayload(), &cr); err != nil {
+		logger.Error(err, "invalid request.cancel payload")
+		return
+	}
+	a.cancelMu.Lock()
+	cancel, ok := a.cancels[cr.RequestID]
+	a.cancelMu.Unlock()
+	if ok {
+		cancel()
+		logger.Info("cancelled in-flight request", "requestID", cr.RequestID)
+	}
+}
+
 // handleAndReply executes a single-shot request and sends its one AgentResult
-// back over the Control stream. Streaming methods (images.pull, fs.read, fs.write)
-// are dispatched separately by startRequest. A send failure is logged: the
-// controller-side dispatcher unblocks via its own timeout, so there is nothing
-// to return here.
+// back over the Control stream. Streaming methods are dispatched separately by
+// startRequest. A send failure is logged: the controller-side dispatcher
+// unblocks via its own timeout, so there is nothing to return here.
 func (a *agent) handleAndReply(ctx context.Context, req *hostlinkv1.AgentRequest, logger logr.Logger) {
 	event := a.handleRequest(ctx, req)
 	if err := a.send(event); err != nil {
