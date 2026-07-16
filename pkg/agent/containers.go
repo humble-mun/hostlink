@@ -258,6 +258,7 @@ func (a *agent) inspectContainer(ctx context.Context, req *hostlinkv1.AgentReque
 	if resp.NetworkSettings != nil {
 		detail.Ports = projectPortMap(resp.NetworkSettings.Ports)
 	}
+	detail.Networks = projectNetworks(resp.NetworkSettings)
 
 	if payload, err = json.Marshal(detail); err != nil {
 		a.logger.Error(err, "marshal containers.inspect result failed")
@@ -287,6 +288,24 @@ func projectPortMap(pm nat.PortMap) (ports []agentapi.ContainerPort) {
 		}
 	}
 	return
+}
+
+// projectNetworks flattens the Docker network map to network name -> IPv4.
+func projectNetworks(settings *container.NetworkSettings) map[string]string {
+	if settings == nil || len(settings.Networks) == 0 {
+		return nil
+	}
+	networks := make(map[string]string, len(settings.Networks))
+	for name, endpoint := range settings.Networks {
+		if endpoint == nil || endpoint.IPAddress == "" {
+			continue
+		}
+		networks[name] = endpoint.IPAddress
+	}
+	if len(networks) == 0 {
+		return nil
+	}
+	return networks
 }
 
 // handleLogs runs a streaming containers.logs: each demuxed log line is sent as

@@ -399,6 +399,7 @@ type ContainerDetail struct {
 	Env           []string          `json:"env,omitempty"`
 	WorkingDir    string            `json:"workingDir,omitempty"`
 	Labels        map[string]string `json:"labels,omitempty"`
+	Networks      map[string]string `json:"networks,omitempty"`
 	Ports         []ContainerPort   `json:"ports,omitempty"`
 	Binds         []string          `json:"binds,omitempty"`
 	RestartPolicy string            `json:"restartPolicy,omitempty"`
