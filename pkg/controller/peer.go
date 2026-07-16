@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/spf13/viper"
@@ -33,8 +34,10 @@ var errAgentNotConnected = errors.New("agent not connected")
 // agent cannot reach this plane and target other agents.
 type peerServer struct {
 	hostlinkv1.UnimplementedControllerPeerServer
-	logger   logr.Logger
-	registry *registry
+	logger      logr.Logger
+	registry    *registry
+	sessions    *sessionTable
+	pairTimeout time.Duration
 }
 
 // Dispatch resolves the agent locally and runs the request. A mapping that has
@@ -447,7 +450,7 @@ func peerClientCredentials(logger logr.Logger) (creds credentials.TransportCrede
 // background. The returned done channel is closed once the serve goroutine has
 // fully exited, so a caller that triggers GracefulStop can wait for a clean
 // shutdown. Bind errors surface synchronously so a misconfiguration fails fast.
-func startPeerServer(logger logr.Logger, bindAddr string, reg *registry) (srv *grpc.Server, done <-chan struct{}, err error) {
+func startPeerServer(logger logr.Logger, bindAddr string, reg *registry, sessions *sessionTable) (srv *grpc.Server, done <-chan struct{}, err error) {
 	var creds credentials.TransportCredentials
 	if creds, err = peerServerCredentials(logger); err != nil {
 		return
@@ -460,7 +463,7 @@ func startPeerServer(logger logr.Logger, bindAddr string, reg *registry) (srv *g
 	}
 
 	srv = grpc.NewServer(grpc.Creds(creds), grpc.MaxRecvMsgSize(GRPCMaxRecvMsgSize()))
-	hostlinkv1.RegisterControllerPeerServer(srv, &peerServer{logger: logger, registry: reg})
+	hostlinkv1.RegisterControllerPeerServer(srv, &peerServer{logger: logger, registry: reg, sessions: sessions, pairTimeout: forwardPairTimeout})
 
 	stopped := make(chan struct{})
 	done = stopped
