@@ -97,6 +97,23 @@ redis:
   url: ""
 
 # ---------------------------------------------------------------------------
+# Port forwarding
+# ---------------------------------------------------------------------------
+# The controller binds every port in range dynamically; they are intentionally
+# not enumerated as container ports in the StatefulSet.
+portForward:
+  # Public TCP port range reserved for agent port forwarding, e.g. "1025-2025".
+  # Empty disables port forwarding.
+  range: ""
+  service:
+    # When enabled, renders an additional Service exposing every port in the
+    # range on the controller pods. Most deployments should leave this off and
+    # let the platform create Services/LBs for active ports instead.
+    enabled: false
+    type: LoadBalancer
+    annotations: {}
+
+# ---------------------------------------------------------------------------
 # cert-manager (optional certificate issuance)
 # ---------------------------------------------------------------------------
 # When enabled, the controller's mTLS material -- the agent-facing gRPC server

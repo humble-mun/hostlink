@@ -1,0 +1,45 @@
+{{- if and .Values.portForward.range .Values.portForward.service.enabled }}
+{{- $portRange := .Values.portForward.range }}
+{{- if not (regexMatch "^[0-9]+(-[0-9]+)?$" $portRange) }}
+{{- fail "portForward.range must be a single numeric port or an inclusive numeric range such as 1025-2025." }}
+{{- end }}
+{{- $parts := regexSplit "-" $portRange -1 }}
+{{- $from := index $parts 0 }}
+{{- $to := $from }}
+{{- if eq (len $parts) 2 }}
+{{- $to = index $parts 1 }}
+{{- end }}
+{{- if or (lt (int $from) 1) (gt (int $to) 65535) }}
+{{- fail "portForward.range ports must be between 1 and 65535." }}
+{{- end }}
+{{- if gt (int $from) (int $to) }}
+{{- fail "portForward.range start port must not exceed its end port." }}
+{{- end }}
+{{- if gt (add (sub (int $to) (int $from)) 1) 2000 }}
+{{- fail "portForward.range must contain at most 2000 ports." }}
+{{- end }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-forward
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Release.Name }}
+  {{- with .Values.portForward.service.annotations }}
+  annotations:
+    {{- range $key, $value := . }}
+    {{ $key }}: {{ $value | quote }}
+    {{- end }}
+  {{- end }}
+spec:
+  type: {{ .Values.portForward.service.type }}
+  selector:
+    app: {{ .Release.Name }}
+  ports:
+  {{- range untilStep (int $from) (int (add $to 1)) 1 }}
+  - name: fwd-{{ . }}
+    port: {{ . }}
+    targetPort: {{ . }}
+    protocol: TCP
+  {{- end }}
+{{- end }}

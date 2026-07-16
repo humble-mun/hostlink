@@ -49,6 +49,10 @@ data:
     grpc-tls-ca-path: {{ .Values.grpc.tlsCAPath }}
     # Cross-pod agent registry. Empty url => in-memory single-replica mode.
     redis-url: {{ .Values.redis.url | quote }}
+    {{- if .Values.portForward.range }}
+    # Reserved public TCP ports are bound dynamically; containerPorts stay small.
+    forward-port-range: {{ .Values.portForward.range | quote }}
+    {{- end }}
     {{- if $peerEnabled }}
     # ControllerPeer plane (cross-pod relay). The advertise address is built from
     # the pod's DNS at runtime via HM_PEER_ADVERTISE_ADDRESS, not set here.
