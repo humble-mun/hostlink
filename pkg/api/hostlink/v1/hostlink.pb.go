@@ -25,8 +25,10 @@ type Frame_Type int32
 
 const (
 	Frame_DATA       Frame_Type = 0
-	Frame_HALF_CLOSE Frame_Type = 1
-	Frame_RESET      Frame_Type = 2
+	Frame_HALF_CLOSE Frame_Type = 1 // sender hit local read EOF: no more data this direction
+	Frame_RESET      Frame_Type = 2 // hard failure: abort both directions immediately
+	Frame_OPEN       Frame_Type = 3 // first frame of a stream: pairs by session_id (+ open on the peer hop)
+	Frame_READY      Frame_Type = 4 // peer-hop ack: end-to-end pipe established, safe to consume public bytes
 )
 
 // Enum value maps for Frame_Type.
@@ -35,11 +37,15 @@ var (
 		0: "DATA",
 		1: "HALF_CLOSE",
 		2: "RESET",
+		3: "OPEN",
+		4: "READY",
 	}
 	Frame_Type_value = map[string]int32{
 		"DATA":       0,
 		"HALF_CLOSE": 1,
 		"RESET":      2,
+		"OPEN":       3,
+		"READY":      4,
 	}
 )
 
@@ -1072,10 +1078,14 @@ func (x *ExposeRule) GetRemove() bool {
 // Because a gRPC stream's own lifecycle cannot represent TCP's independent
 // per-direction half-close, half-close and reset are explicit frame types.
 type Frame struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	SessionId     string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"` // set on the first frame of a Forward stream, for pairing
-	Type          Frame_Type             `protobuf:"varint,2,opt,name=type,proto3,enum=hostlink.v1.Frame_Type" json:"type,omitempty"`
-	Data          []byte                 `protobuf:"bytes,3,opt,name=data,proto3" json:"data,omitempty"` // valid only when Type == DATA
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	SessionId string                 `protobuf:"bytes,1,opt,name=session_id,json=sessionId,proto3" json:"session_id,omitempty"` // set on the first (OPEN, or failure RESET) frame, for pairing
+	Type      Frame_Type             `protobuf:"varint,2,opt,name=type,proto3,enum=hostlink.v1.Frame_Type" json:"type,omitempty"`
+	Data      []byte                 `protobuf:"bytes,3,opt,name=data,proto3" json:"data,omitempty"` // valid only when Type == DATA
+	// Routing key set only on the OPEN frame of a cross-pod
+	// ControllerPeer.Forward stream; never set on agent-facing
+	// AgentLink.Forward streams.
+	Open          *PeerForwardOpen `protobuf:"bytes,4,opt,name=open,proto3" json:"open,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1129,6 +1139,68 @@ func (x *Frame) GetData() []byte {
 		return x.Data
 	}
 	return nil
+}
+
+func (x *Frame) GetOpen() *PeerForwardOpen {
+	if x != nil {
+		return x.Open
+	}
+	return nil
+}
+
+// PeerForwardOpen is the routing key carried by the OPEN frame of a cross-pod
+// ControllerPeer.Forward stream: which agent holds the target and which
+// container-side address to dial.
+type PeerForwardOpen struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	AgentId       string                 `protobuf:"bytes,1,opt,name=agent_id,json=agentId,proto3" json:"agent_id,omitempty"`
+	Target        string                 `protobuf:"bytes,2,opt,name=target,proto3" json:"target,omitempty"` // container-side addr, e.g. 172.30.1.5:8080
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PeerForwardOpen) Reset() {
+	*x = PeerForwardOpen{}
+	mi := &file_hostlink_v1_hostlink_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PeerForwardOpen) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PeerForwardOpen) ProtoMessage() {}
+
+func (x *PeerForwardOpen) ProtoReflect() protoreflect.Message {
+	mi := &file_hostlink_v1_hostlink_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PeerForwardOpen.ProtoReflect.Descriptor instead.
+func (*PeerForwardOpen) Descriptor() ([]byte, []int) {
+	return file_hostlink_v1_hostlink_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *PeerForwardOpen) GetAgentId() string {
+	if x != nil {
+		return x.AgentId
+	}
+	return ""
+}
+
+func (x *PeerForwardOpen) GetTarget() string {
+	if x != nil {
+		return x.Target
+	}
+	return ""
 }
 
 var File_hostlink_v1_hostlink_proto protoreflect.FileDescriptor
@@ -1201,24 +1273,31 @@ const file_hostlink_v1_hostlink_proto_rawDesc = "" +
 	"\x10container_target\x18\x01 \x01(\tR\x0fcontainerTarget\x12\x1f\n" +
 	"\vpublic_port\x18\x02 \x01(\rR\n" +
 	"publicPort\x12\x16\n" +
-	"\x06remove\x18\x03 \x01(\bR\x06remove\"\x94\x01\n" +
+	"\x06remove\x18\x03 \x01(\bR\x06remove\"\xdb\x01\n" +
 	"\x05Frame\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x12+\n" +
 	"\x04type\x18\x02 \x01(\x0e2\x17.hostlink.v1.Frame.TypeR\x04type\x12\x12\n" +
-	"\x04data\x18\x03 \x01(\fR\x04data\"+\n" +
+	"\x04data\x18\x03 \x01(\fR\x04data\x120\n" +
+	"\x04open\x18\x04 \x01(\v2\x1c.hostlink.v1.PeerForwardOpenR\x04open\"@\n" +
 	"\x04Type\x12\b\n" +
 	"\x04DATA\x10\x00\x12\x0e\n" +
 	"\n" +
 	"HALF_CLOSE\x10\x01\x12\t\n" +
-	"\x05RESET\x10\x022\x80\x01\n" +
+	"\x05RESET\x10\x02\x12\b\n" +
+	"\x04OPEN\x10\x03\x12\t\n" +
+	"\x05READY\x10\x04\"D\n" +
+	"\x0fPeerForwardOpen\x12\x19\n" +
+	"\bagent_id\x18\x01 \x01(\tR\aagentId\x12\x16\n" +
+	"\x06target\x18\x02 \x01(\tR\x06target2\x80\x01\n" +
 	"\tAgentLink\x12<\n" +
 	"\aControl\x12\x17.hostlink.v1.AgentEvent\x1a\x14.hostlink.v1.Command(\x010\x01\x125\n" +
-	"\aForward\x12\x12.hostlink.v1.Frame\x1a\x12.hostlink.v1.Frame(\x010\x012\xe0\x01\n" +
+	"\aForward\x12\x12.hostlink.v1.Frame\x1a\x12.hostlink.v1.Frame(\x010\x012\x97\x02\n" +
 	"\x0eControllerPeer\x12B\n" +
 	"\bDispatch\x12\x1c.hostlink.v1.DispatchRequest\x1a\x18.hostlink.v1.AgentResult\x12J\n" +
 	"\x0eDispatchStream\x12\x1c.hostlink.v1.DispatchRequest\x1a\x18.hostlink.v1.AgentResult0\x01\x12>\n" +
-	"\x06Upload\x12\x18.hostlink.v1.UploadFrame\x1a\x18.hostlink.v1.AgentResult(\x01B?Z=github.com/humble-mun/hostlink/pkg/api/hostlink/v1;hostlinkv1b\x06proto3"
+	"\x06Upload\x12\x18.hostlink.v1.UploadFrame\x1a\x18.hostlink.v1.AgentResult(\x01\x125\n" +
+	"\aForward\x12\x12.hostlink.v1.Frame\x1a\x12.hostlink.v1.Frame(\x010\x01B?Z=github.com/humble-mun/hostlink/pkg/api/hostlink/v1;hostlinkv1b\x06proto3"
 
 var (
 	file_hostlink_v1_hostlink_proto_rawDescOnce sync.Once
@@ -1233,7 +1312,7 @@ func file_hostlink_v1_hostlink_proto_rawDescGZIP() []byte {
 }
 
 var file_hostlink_v1_hostlink_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_hostlink_v1_hostlink_proto_msgTypes = make([]protoimpl.MessageInfo, 15)
+var file_hostlink_v1_hostlink_proto_msgTypes = make([]protoimpl.MessageInfo, 16)
 var file_hostlink_v1_hostlink_proto_goTypes = []any{
 	(Frame_Type)(0),           // 0: hostlink.v1.Frame.Type
 	(*AgentEvent)(nil),        // 1: hostlink.v1.AgentEvent
@@ -1251,6 +1330,7 @@ var file_hostlink_v1_hostlink_proto_goTypes = []any{
 	(*DockerOp)(nil),          // 13: hostlink.v1.DockerOp
 	(*ExposeRule)(nil),        // 14: hostlink.v1.ExposeRule
 	(*Frame)(nil),             // 15: hostlink.v1.Frame
+	(*PeerForwardOpen)(nil),   // 16: hostlink.v1.PeerForwardOpen
 }
 var file_hostlink_v1_hostlink_proto_depIdxs = []int32{
 	2,  // 0: hostlink.v1.AgentEvent.hello:type_name -> hostlink.v1.Hello
@@ -1266,21 +1346,24 @@ var file_hostlink_v1_hostlink_proto_depIdxs = []int32{
 	7,  // 10: hostlink.v1.DispatchRequest.request:type_name -> hostlink.v1.AgentRequest
 	10, // 11: hostlink.v1.UploadFrame.open:type_name -> hostlink.v1.DispatchRequest
 	0,  // 12: hostlink.v1.Frame.type:type_name -> hostlink.v1.Frame.Type
-	1,  // 13: hostlink.v1.AgentLink.Control:input_type -> hostlink.v1.AgentEvent
-	15, // 14: hostlink.v1.AgentLink.Forward:input_type -> hostlink.v1.Frame
-	10, // 15: hostlink.v1.ControllerPeer.Dispatch:input_type -> hostlink.v1.DispatchRequest
-	10, // 16: hostlink.v1.ControllerPeer.DispatchStream:input_type -> hostlink.v1.DispatchRequest
-	11, // 17: hostlink.v1.ControllerPeer.Upload:input_type -> hostlink.v1.UploadFrame
-	5,  // 18: hostlink.v1.AgentLink.Control:output_type -> hostlink.v1.Command
-	15, // 19: hostlink.v1.AgentLink.Forward:output_type -> hostlink.v1.Frame
-	8,  // 20: hostlink.v1.ControllerPeer.Dispatch:output_type -> hostlink.v1.AgentResult
-	8,  // 21: hostlink.v1.ControllerPeer.DispatchStream:output_type -> hostlink.v1.AgentResult
-	8,  // 22: hostlink.v1.ControllerPeer.Upload:output_type -> hostlink.v1.AgentResult
-	18, // [18:23] is the sub-list for method output_type
-	13, // [13:18] is the sub-list for method input_type
-	13, // [13:13] is the sub-list for extension type_name
-	13, // [13:13] is the sub-list for extension extendee
-	0,  // [0:13] is the sub-list for field type_name
+	16, // 13: hostlink.v1.Frame.open:type_name -> hostlink.v1.PeerForwardOpen
+	1,  // 14: hostlink.v1.AgentLink.Control:input_type -> hostlink.v1.AgentEvent
+	15, // 15: hostlink.v1.AgentLink.Forward:input_type -> hostlink.v1.Frame
+	10, // 16: hostlink.v1.ControllerPeer.Dispatch:input_type -> hostlink.v1.DispatchRequest
+	10, // 17: hostlink.v1.ControllerPeer.DispatchStream:input_type -> hostlink.v1.DispatchRequest
+	11, // 18: hostlink.v1.ControllerPeer.Upload:input_type -> hostlink.v1.UploadFrame
+	15, // 19: hostlink.v1.ControllerPeer.Forward:input_type -> hostlink.v1.Frame
+	5,  // 20: hostlink.v1.AgentLink.Control:output_type -> hostlink.v1.Command
+	15, // 21: hostlink.v1.AgentLink.Forward:output_type -> hostlink.v1.Frame
+	8,  // 22: hostlink.v1.ControllerPeer.Dispatch:output_type -> hostlink.v1.AgentResult
+	8,  // 23: hostlink.v1.ControllerPeer.DispatchStream:output_type -> hostlink.v1.AgentResult
+	8,  // 24: hostlink.v1.ControllerPeer.Upload:output_type -> hostlink.v1.AgentResult
+	15, // 25: hostlink.v1.ControllerPeer.Forward:output_type -> hostlink.v1.Frame
+	20, // [20:26] is the sub-list for method output_type
+	14, // [14:20] is the sub-list for method input_type
+	14, // [14:14] is the sub-list for extension type_name
+	14, // [14:14] is the sub-list for extension extendee
+	0,  // [0:14] is the sub-list for field type_name
 }
 
 func init() { file_hostlink_v1_hostlink_proto_init() }
@@ -1312,7 +1395,7 @@ func file_hostlink_v1_hostlink_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_hostlink_v1_hostlink_proto_rawDesc), len(file_hostlink_v1_hostlink_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   15,
+			NumMessages:   16,
 			NumExtensions: 0,
 			NumServices:   2,
 		},

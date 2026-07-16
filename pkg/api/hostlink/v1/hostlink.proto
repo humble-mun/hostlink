@@ -15,9 +15,11 @@ service AgentLink {
   // already-open stream.
   rpc Control(stream AgentEvent) returns (stream Command);
 
-  // One per forwarded public TCP connection; opened by the agent, first frame
-  // carries session_id for pairing. Internal cross-pod forwarding reuses this
-  // same service definition (just dialed to a sibling pod).
+  // One per forwarded public TCP connection; opened by the agent after an
+  // OpenForward command. The first frame is an OPEN frame carrying session_id
+  // for pairing, or RESET (with session_id) if the container-side dial failed.
+  // Cross-pod forwarding travels over ControllerPeer.Forward on the peer
+  // plane instead of this agent-facing service.
   rpc Forward(stream Frame) returns (stream Frame);
 }
 
@@ -48,6 +50,17 @@ service ControllerPeer {
   // terminal AgentResult. A pod that no longer holds the agent rejects with
   // FAILED_PRECONDITION so the caller re-resolves and retries.
   rpc Upload(stream UploadFrame) returns (AgentResult);
+
+  // Forward relays one public TCP connection's byte pipe to the holding pod.
+  // The requesting pod sends an OPEN frame first (session_id + open carrying
+  // the agent_id/target routing key); the holding pod pushes OpenForward to
+  // the agent, pairs the agent's AgentLink.Forward stream, splices the two
+  // pipes, and replies with a READY frame once the end-to-end path is
+  // established, so the caller only then starts consuming the public socket.
+  // A pod that no longer holds the agent rejects with FAILED_PRECONDITION so
+  // the caller re-resolves the holder and retries before any public bytes
+  // have been consumed.
+  rpc Forward(stream Frame) returns (stream Frame);
 }
 
 // AgentEvent is the agent->controller direction of the Control stream.
@@ -177,12 +190,27 @@ message ExposeRule {
 // Because a gRPC stream's own lifecycle cannot represent TCP's independent
 // per-direction half-close, half-close and reset are explicit frame types.
 message Frame {
-  string session_id = 1; // set on the first frame of a Forward stream, for pairing
+  string session_id = 1; // set on the first (OPEN, or failure RESET) frame, for pairing
   enum Type {
     DATA = 0;
-    HALF_CLOSE = 1;
-    RESET = 2;
+    HALF_CLOSE = 1; // sender hit local read EOF: no more data this direction
+    RESET = 2;      // hard failure: abort both directions immediately
+    OPEN = 3;       // first frame of a stream: pairs by session_id (+ open on the peer hop)
+    READY = 4;      // peer-hop ack: end-to-end pipe established, safe to consume public bytes
   }
   Type  type = 2;
   bytes data = 3; // valid only when Type == DATA
+
+  // Routing key set only on the OPEN frame of a cross-pod
+  // ControllerPeer.Forward stream; never set on agent-facing
+  // AgentLink.Forward streams.
+  PeerForwardOpen open = 4;
+}
+
+// PeerForwardOpen is the routing key carried by the OPEN frame of a cross-pod
+// ControllerPeer.Forward stream: which agent holds the target and which
+// container-side address to dial.
+message PeerForwardOpen {
+  string agent_id = 1;
+  string target = 2; // container-side addr, e.g. 172.30.1.5:8080
 }

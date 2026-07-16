@@ -37,9 +37,11 @@ type AgentLinkClient interface {
 	// agent down the response stream. All server->agent commands travel over this
 	// already-open stream.
 	Control(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[AgentEvent, Command], error)
-	// One per forwarded public TCP connection; opened by the agent, first frame
-	// carries session_id for pairing. Internal cross-pod forwarding reuses this
-	// same service definition (just dialed to a sibling pod).
+	// One per forwarded public TCP connection; opened by the agent after an
+	// OpenForward command. The first frame is an OPEN frame carrying session_id
+	// for pairing, or RESET (with session_id) if the container-side dial failed.
+	// Cross-pod forwarding travels over ControllerPeer.Forward on the peer
+	// plane instead of this agent-facing service.
 	Forward(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[Frame, Frame], error)
 }
 
@@ -91,9 +93,11 @@ type AgentLinkServer interface {
 	// agent down the response stream. All server->agent commands travel over this
 	// already-open stream.
 	Control(grpc.BidiStreamingServer[AgentEvent, Command]) error
-	// One per forwarded public TCP connection; opened by the agent, first frame
-	// carries session_id for pairing. Internal cross-pod forwarding reuses this
-	// same service definition (just dialed to a sibling pod).
+	// One per forwarded public TCP connection; opened by the agent after an
+	// OpenForward command. The first frame is an OPEN frame carrying session_id
+	// for pairing, or RESET (with session_id) if the container-side dial failed.
+	// Cross-pod forwarding travels over ControllerPeer.Forward on the peer
+	// plane instead of this agent-facing service.
 	Forward(grpc.BidiStreamingServer[Frame, Frame]) error
 	mustEmbedUnimplementedAgentLinkServer()
 }
@@ -174,6 +178,7 @@ const (
 	ControllerPeer_Dispatch_FullMethodName       = "/hostlink.v1.ControllerPeer/Dispatch"
 	ControllerPeer_DispatchStream_FullMethodName = "/hostlink.v1.ControllerPeer/DispatchStream"
 	ControllerPeer_Upload_FullMethodName         = "/hostlink.v1.ControllerPeer/Upload"
+	ControllerPeer_Forward_FullMethodName        = "/hostlink.v1.ControllerPeer/Forward"
 )
 
 // ControllerPeerClient is the client API for ControllerPeer service.
@@ -205,6 +210,16 @@ type ControllerPeerClient interface {
 	// terminal AgentResult. A pod that no longer holds the agent rejects with
 	// FAILED_PRECONDITION so the caller re-resolves and retries.
 	Upload(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[UploadFrame, AgentResult], error)
+	// Forward relays one public TCP connection's byte pipe to the holding pod.
+	// The requesting pod sends an OPEN frame first (session_id + open carrying
+	// the agent_id/target routing key); the holding pod pushes OpenForward to
+	// the agent, pairs the agent's AgentLink.Forward stream, splices the two
+	// pipes, and replies with a READY frame once the end-to-end path is
+	// established, so the caller only then starts consuming the public socket.
+	// A pod that no longer holds the agent rejects with FAILED_PRECONDITION so
+	// the caller re-resolves the holder and retries before any public bytes
+	// have been consumed.
+	Forward(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[Frame, Frame], error)
 }
 
 type controllerPeerClient struct {
@@ -257,6 +272,19 @@ func (c *controllerPeerClient) Upload(ctx context.Context, opts ...grpc.CallOpti
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type ControllerPeer_UploadClient = grpc.ClientStreamingClient[UploadFrame, AgentResult]
 
+func (c *controllerPeerClient) Forward(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[Frame, Frame], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &ControllerPeer_ServiceDesc.Streams[2], ControllerPeer_Forward_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[Frame, Frame]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type ControllerPeer_ForwardClient = grpc.BidiStreamingClient[Frame, Frame]
+
 // ControllerPeerServer is the server API for ControllerPeer service.
 // All implementations must embed UnimplementedControllerPeerServer
 // for forward compatibility.
@@ -286,6 +314,16 @@ type ControllerPeerServer interface {
 	// terminal AgentResult. A pod that no longer holds the agent rejects with
 	// FAILED_PRECONDITION so the caller re-resolves and retries.
 	Upload(grpc.ClientStreamingServer[UploadFrame, AgentResult]) error
+	// Forward relays one public TCP connection's byte pipe to the holding pod.
+	// The requesting pod sends an OPEN frame first (session_id + open carrying
+	// the agent_id/target routing key); the holding pod pushes OpenForward to
+	// the agent, pairs the agent's AgentLink.Forward stream, splices the two
+	// pipes, and replies with a READY frame once the end-to-end path is
+	// established, so the caller only then starts consuming the public socket.
+	// A pod that no longer holds the agent rejects with FAILED_PRECONDITION so
+	// the caller re-resolves the holder and retries before any public bytes
+	// have been consumed.
+	Forward(grpc.BidiStreamingServer[Frame, Frame]) error
 	mustEmbedUnimplementedControllerPeerServer()
 }
 
@@ -304,6 +342,9 @@ func (UnimplementedControllerPeerServer) DispatchStream(*DispatchRequest, grpc.S
 }
 func (UnimplementedControllerPeerServer) Upload(grpc.ClientStreamingServer[UploadFrame, AgentResult]) error {
 	return status.Error(codes.Unimplemented, "method Upload not implemented")
+}
+func (UnimplementedControllerPeerServer) Forward(grpc.BidiStreamingServer[Frame, Frame]) error {
+	return status.Error(codes.Unimplemented, "method Forward not implemented")
 }
 func (UnimplementedControllerPeerServer) mustEmbedUnimplementedControllerPeerServer() {}
 func (UnimplementedControllerPeerServer) testEmbeddedByValue()                        {}
@@ -362,6 +403,13 @@ func _ControllerPeer_Upload_Handler(srv interface{}, stream grpc.ServerStream) e
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type ControllerPeer_UploadServer = grpc.ClientStreamingServer[UploadFrame, AgentResult]
 
+func _ControllerPeer_Forward_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(ControllerPeerServer).Forward(&grpc.GenericServerStream[Frame, Frame]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type ControllerPeer_ForwardServer = grpc.BidiStreamingServer[Frame, Frame]
+
 // ControllerPeer_ServiceDesc is the grpc.ServiceDesc for ControllerPeer service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -383,6 +431,12 @@ var ControllerPeer_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "Upload",
 			Handler:       _ControllerPeer_Upload_Handler,
+			ClientStreams: true,
+		},
+		{
+			StreamName:    "Forward",
+			Handler:       _ControllerPeer_Forward_Handler,
+			ServerStreams: true,
 			ClientStreams: true,
 		},
 	},
