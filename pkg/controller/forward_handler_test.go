@@ -33,7 +33,7 @@ func TestForwardHandlerUnknownPort(t *testing.T) {
 	assertNoForwardCommand(t, commands)
 }
 
-func TestForwardHandlerAgentNotLocal(t *testing.T) {
+func TestForwardHandlerRemoteAborts_whenPeerForwardingDisabled(t *testing.T) {
 	// Given
 	forwarder, commands := newTestForwarder(t, false)
 	const port = 41002
@@ -188,7 +188,7 @@ func newTestForwarder(t *testing.T, localAgent bool) (*forwarder, <-chan *hostli
 	if localAgent {
 		registry.add(newAgentConn("agent-a", stream, logr.Discard()))
 	}
-	return newForwarder(logr.Discard(), registry, newSessionTable(), newPortStore(logr.Discard(), nil)), stream.commands
+	return newForwarder(logr.Discard(), registry, newSessionTable(), newPortStore(logr.Discard(), nil), nil, ""), stream.commands
 }
 
 func allocateTestPort(t *testing.T, store portStore, port uint32, mapping portMapping) {

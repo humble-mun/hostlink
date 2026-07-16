@@ -62,6 +62,10 @@ func RegisterGRPCService(logger logr.Logger, nodeName string, srv *grpc.Server) 
 	hostlinkv1.RegisterAgentLinkServer(srv, &impl{logger: logger.WithName("service"), nodeName: nodeName, registry: reg, sessions: sessions})
 
 	s := &service{logger: logger, nodeName: nodeName, registry: reg, selfAddr: selfAddr, sessions: sessions}
+	if err = s.startPeerPlane(logger.WithName("peer"), reg); err != nil {
+		err = fmt.Errorf("controller: %w", err)
+		return
+	}
 	if rawRange := viper.GetString(flagForwardPortRange); rawRange != "" {
 		portRange, parseErr := parsePortRange(rawRange)
 		if parseErr != nil {
@@ -69,7 +73,7 @@ func RegisterGRPCService(logger logr.Logger, nodeName string, srv *grpc.Server) 
 			return
 		}
 		s.store = newPortStore(logger.WithName("ports"), redis)
-		fwd := newForwarder(logger, reg, sessions, s.store)
+		fwd := newForwarder(logger, reg, sessions, s.store, s.peers, selfAddr)
 		s.listeners = newListenerManager(logger.WithName("listeners"), fwd.handleConn)
 		fwdCtx, fwdCancel := context.WithCancel(context.Background())
 		s.fwdCancel = fwdCancel
@@ -78,10 +82,6 @@ func RegisterGRPCService(logger logr.Logger, nodeName string, srv *grpc.Server) 
 		go runPortReconciler(fwdCtx, logger.WithName("ports"), s.store, s.listeners)
 	}
 	svc = s
-	if err = s.startPeerPlane(logger.WithName("peer"), reg); err != nil {
-		err = fmt.Errorf("controller: %w", err)
-		return
-	}
 
 	if crossPod {
 		logger.Info("registry mode: redis-backed (cross-pod relay enabled)", "peerAdvertise", selfAddr, "peerBind", peerBind)

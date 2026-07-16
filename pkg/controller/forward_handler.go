@@ -21,15 +21,19 @@ type forwarder struct {
 	registry    *registry
 	sessions    *sessionTable
 	store       portStore
+	peers       *peerClients
+	selfAddr    string
 	pairTimeout time.Duration
 }
 
-func newForwarder(logger logr.Logger, registry *registry, sessions *sessionTable, store portStore) *forwarder {
+func newForwarder(logger logr.Logger, registry *registry, sessions *sessionTable, store portStore, peers *peerClients, selfAddr string) *forwarder {
 	return &forwarder{
 		logger:      logger.WithName("forward"),
 		registry:    registry,
 		sessions:    sessions,
 		store:       store,
+		peers:       peers,
+		selfAddr:    selfAddr,
 		pairTimeout: forwardPairTimeout,
 	}
 }
@@ -69,8 +73,8 @@ func (f *forwarder) handleConn(ctx context.Context, port uint32, conn *net.TCPCo
 
 	agent, local := f.registry.get(mapping.AgentID)
 	if !local {
-		f.logger.Info("agent not held locally", "port", port, "agentID", mapping.AgentID)
-		abort()
+		f.handleRemote(ctx, port, conn, mapping)
+		closed = true
 		return
 	}
 
@@ -113,6 +117,65 @@ func (f *forwarder) handleConn(ctx context.Context, port uint32, conn *net.TCPCo
 	case <-ctx.Done():
 		f.logger.Info("public connection canceled before forward pairing", "port", port, "agentID", mapping.AgentID)
 		abort()
+	}
+}
+
+func (f *forwarder) handleRemote(ctx context.Context, port uint32, conn *net.TCPConn, mapping portMapping) {
+	abort := func() {
+		if err := rstClose(conn); err != nil {
+			f.logger.Error(err, "reset public connection failed", "port", port)
+		}
+	}
+	if f.peers == nil {
+		f.logger.V(0).Info("cross-pod forwarding disabled", "port", port, "agentID", mapping.AgentID)
+		abort()
+		return
+	}
+
+	for attempt := range 2 {
+		locateCtx, cancel := context.WithTimeout(ctx, redisOpTimeout)
+		addr, err := f.registry.locate(locateCtx, mapping.AgentID)
+		cancel()
+		if err != nil {
+			f.logger.Error(err, "locate remote agent holder failed", "port", port, "agentID", mapping.AgentID)
+			abort()
+			return
+		}
+		if addr == "" {
+			f.logger.Info("remote agent holder is unavailable", "port", port, "agentID", mapping.AgentID)
+			abort()
+			return
+		}
+		if addr == f.selfAddr {
+			f.logger.Info("remote agent holder points to this controller", "port", port, "agentID", mapping.AgentID)
+			abort()
+			return
+		}
+
+		sessionID, err := newSessionID()
+		if err != nil {
+			f.logger.Error(err, "generate remote forward session ID failed", "port", port, "agentID", mapping.AgentID)
+			abort()
+			return
+		}
+		stream, err := f.peers.forward(ctx, addr, mapping.AgentID, mapping.Target, sessionID)
+		if err != nil {
+			if errors.Is(err, errAgentNotConnected) && attempt == 0 {
+				f.logger.V(1).Info("remote agent holder was stale; retrying", "port", port, "agentID", mapping.AgentID)
+				continue
+			}
+			f.logger.Error(err, "open remote forward failed", "port", port, "agentID", mapping.AgentID)
+			abort()
+			return
+		}
+
+		if err := tunnel.SpliceConn(conn, stream); err != nil {
+			f.logger.V(1).Info("splice remote public connection failed", "port", port, "agentID", mapping.AgentID, "error", err)
+		}
+		if err := stream.CloseSend(); err != nil {
+			f.logger.V(1).Info("close remote forward stream send failed", "port", port, "agentID", mapping.AgentID, "error", err)
+		}
+		return
 	}
 }
 
