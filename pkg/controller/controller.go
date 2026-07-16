@@ -90,11 +90,12 @@ func RegisterGRPCService(logger logr.Logger, nodeName string, srv *grpc.Server) 
 	if forwardRangeRaw != "" {
 		fwd := newForwarder(logger, reg, sessions, s.store, s.peers, selfAddr)
 		s.listeners = newListenerManager(logger.WithName("listeners"), fwd.handleConn)
+		s.bindings = newBindingTracker(logger.WithName("bindings"), redis, selfAddr, s.listeners.boundPorts)
 		fwdCtx, fwdCancel := context.WithCancel(context.Background())
 		s.fwdCancel = fwdCancel
 		s.rangeFrom = forwardRange.from
 		s.rangeTo = forwardRange.to
-		go runPortReconciler(fwdCtx, logger.WithName("ports"), s.store, s.listeners)
+		go runPortReconciler(fwdCtx, logger.WithName("ports"), s.store, s.listeners, s.bindings)
 	}
 	svc = s
 
@@ -114,6 +115,7 @@ type service struct {
 	sessions  *sessionTable
 	store     portStore
 	listeners *listenerManager
+	bindings  *bindingTracker
 	fwdCancel context.CancelFunc
 	rangeFrom uint32
 	rangeTo   uint32

@@ -17,7 +17,8 @@ type createForwardRequest struct {
 }
 
 type forwardResponse struct {
-	Port uint32 `json:"port"`
+	Port  uint32    `json:"port"`
+	State portState `json:"state"`
 	portMapping
 }
 
@@ -60,7 +61,7 @@ func (svc *service) createForward(c *gin.Context) {
 		}
 		return
 	}
-	c.JSON(http.StatusCreated, forwardResponse{Port: allocatedPort, portMapping: mapping})
+	c.JSON(http.StatusCreated, forwardResponse{Port: allocatedPort, State: portStatePending, portMapping: mapping})
 }
 
 // listAgentForwards handles GET /api/v1/agents/:agentId/forwards.
@@ -80,7 +81,13 @@ func (svc *service) listAgentForwards(c *gin.Context) {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "list forwards failed"})
 		return
 	}
-	c.JSON(http.StatusOK, forwardResponses(mappings, agentID))
+	states, err := svc.bindings.states(ctx, mappings)
+	if err != nil {
+		logger.Error(err, "compute forward states failed")
+		c.JSON(http.StatusBadGateway, gin.H{"error": "list forwards failed"})
+		return
+	}
+	c.JSON(http.StatusOK, forwardResponses(mappings, states, agentID))
 }
 
 // listAllForwards handles GET /api/v1/forwards.
@@ -99,7 +106,13 @@ func (svc *service) listAllForwards(c *gin.Context) {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "list forwards failed"})
 		return
 	}
-	c.JSON(http.StatusOK, forwardResponses(mappings, ""))
+	states, err := svc.bindings.states(ctx, mappings)
+	if err != nil {
+		logger.Error(err, "compute forward states failed")
+		c.JSON(http.StatusBadGateway, gin.H{"error": "list forwards failed"})
+		return
+	}
+	c.JSON(http.StatusOK, forwardResponses(mappings, states, ""))
 }
 
 // deleteForward handles DELETE /api/v1/forwards/:port.
@@ -132,13 +145,13 @@ func (svc *service) deleteForward(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
-func forwardResponses(mappings map[uint32]portMapping, agentID string) []forwardResponse {
+func forwardResponses(mappings map[uint32]portMapping, states map[uint32]portState, agentID string) []forwardResponse {
 	responses := make([]forwardResponse, 0, len(mappings))
 	for port, mapping := range mappings {
 		if agentID != "" && mapping.AgentID != agentID {
 			continue
 		}
-		responses = append(responses, forwardResponse{Port: port, portMapping: mapping})
+		responses = append(responses, forwardResponse{Port: port, State: states[port], portMapping: mapping})
 	}
 	sort.Slice(responses, func(i, j int) bool {
 		return responses[i].Port < responses[j].Port

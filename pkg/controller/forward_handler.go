@@ -190,7 +190,7 @@ func rstClose(conn *net.TCPConn) error {
 	return errors.Join(lingerErr, closeErr)
 }
 
-func runPortReconciler(ctx context.Context, logger logr.Logger, store portStore, listeners *listenerManager) {
+func runPortReconciler(ctx context.Context, logger logr.Logger, store portStore, listeners *listenerManager, bindings *bindingTracker) {
 	changes, stop := store.watch()
 	defer stop()
 	ticker := time.NewTicker(5 * time.Second)
@@ -213,6 +213,7 @@ func runPortReconciler(ctx context.Context, logger logr.Logger, store portStore,
 			}
 			logger.V(1).Info("public forward listeners reconciled", "ports", bound)
 		}
+		bindings.reportBound(ctx)
 
 		select {
 		case <-ctx.Done():
