@@ -124,7 +124,7 @@ func (svc *service) startPeerPlane(logger logr.Logger, reg *registry) (err error
 	}
 	svc.peers = newPeerClients(logger.WithName("client"), clientCreds, viper.GetString(flagPeerTLSServerName))
 
-	if svc.peerServer, svc.peerDone, err = startPeerServer(logger.WithName("server"), bindAddr, reg); err != nil {
+	if svc.peerServer, svc.peerDone, err = startPeerServer(logger.WithName("server"), bindAddr, reg, svc.sessions); err != nil {
 		return
 	}
 	return
@@ -134,6 +134,10 @@ func (svc *service) RegisterRoute(mux *gin.Engine) {
 	group := mux.Group("/api/v1")
 	group.GET("/agents", svc.listAgents)
 	group.GET("/metrics", svc.agentMetrics)
+	group.GET("/forwards", svc.listAllForwards)
+	group.DELETE("/forwards/:port", svc.deleteForward)
+	group.POST("/agents/:agentId/forwards", svc.createForward)
+	group.GET("/agents/:agentId/forwards", svc.listAgentForwards)
 	group.GET("/agents/:agentId/images", svc.listAgentImages)
 	group.POST("/agents/:agentId/images", svc.pullAgentImage)
 	group.DELETE("/agents/:agentId/images", svc.removeAgentImages)
