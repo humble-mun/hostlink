@@ -251,6 +251,7 @@ func (a *agent) runSession(ctx context.Context, logger logr.Logger) (connected b
 
 	recvErrCh := make(chan error, 1)
 	go func() { recvErrCh <- a.receiveCommands(sessionCtx, logger) }()
+	go a.watchDockerEvents(sessionCtx)
 
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
