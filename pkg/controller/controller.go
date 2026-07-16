@@ -57,9 +57,10 @@ func RegisterGRPCService(logger logr.Logger, nodeName string, srv *grpc.Server) 
 	}
 
 	reg := newRegistry(logger.WithName("registry"), redis, selfAddr)
-	hostlinkv1.RegisterAgentLinkServer(srv, &impl{logger: logger.WithName("service"), nodeName: nodeName, registry: reg})
+	sessions := newSessionTable()
+	hostlinkv1.RegisterAgentLinkServer(srv, &impl{logger: logger.WithName("service"), nodeName: nodeName, registry: reg, sessions: sessions})
 
-	s := &service{logger: logger, nodeName: nodeName, registry: reg, selfAddr: selfAddr}
+	s := &service{logger: logger, nodeName: nodeName, registry: reg, selfAddr: selfAddr, sessions: sessions}
 	svc = s
 	if err = s.startPeerPlane(logger.WithName("peer"), reg); err != nil {
 		err = fmt.Errorf("controller: %w", err)
@@ -79,6 +80,7 @@ type service struct {
 	nodeName string
 	registry *registry
 	selfAddr string
+	sessions *sessionTable
 
 	peers      *peerClients
 	peerServer *grpc.Server

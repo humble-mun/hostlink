@@ -3,9 +3,12 @@ package controller
 import (
 	"errors"
 	"io"
+	"time"
 
 	"github.com/go-logr/logr"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	hostlinkv1 "github.com/humble-mun/hostlink/pkg/api/hostlink/v1"
 )
@@ -18,6 +21,7 @@ type impl struct {
 	logger   logr.Logger
 	nodeName string
 	registry *registry
+	sessions *sessionTable
 }
 
 // Control runs the bidirectional command stream. On the agent's Hello it registers
@@ -103,8 +107,58 @@ func (s *impl) handleAgentEvent(conn *agentConn, srv grpc.BidiStreamingServer[ho
 	return conn
 }
 
-// Forward is the helloworld-level placeholder for the port-forward byte pipe. The
-// raw-TCP relay (DATA/HALF_CLOSE/RESET framing, backpressure) is implemented later.
-func (s *impl) Forward(grpc.BidiStreamingServer[hostlinkv1.Frame, hostlinkv1.Frame]) error {
-	return nil
+const forwardFirstFrameTimeout = 30 * time.Second
+
+type firstForwardFrame struct {
+	frame *hostlinkv1.Frame
+	err   error
+}
+
+// Forward pairs an agent-opened Forward RPC to the waiting public connection
+// handler. The consumer owns forwardSession.done and must close it when the
+// byte-pipe relay finishes.
+func (s *impl) Forward(srv grpc.BidiStreamingServer[hostlinkv1.Frame, hostlinkv1.Frame]) error {
+	firstResult := make(chan firstForwardFrame, 1)
+	go func() {
+		frame, err := srv.Recv()
+		firstResult <- firstForwardFrame{frame: frame, err: err}
+	}()
+
+	timer := time.NewTimer(forwardFirstFrameTimeout)
+	defer timer.Stop()
+	var first *hostlinkv1.Frame
+	select {
+	case result := <-firstResult:
+		if result.err != nil {
+			return status.Errorf(codes.InvalidArgument, "receive first Forward frame: %v", result.err)
+		}
+		first = result.frame
+	case <-timer.C:
+		return status.Error(codes.InvalidArgument, "timed out waiting for first Forward frame")
+	case <-srv.Context().Done():
+		return srv.Context().Err()
+	}
+
+	sessionID := first.GetSessionId()
+	if sessionID == "" {
+		return status.Error(codes.InvalidArgument, "first Forward frame is missing session ID")
+	}
+	switch first.GetType() {
+	case hostlinkv1.Frame_OPEN, hostlinkv1.Frame_RESET:
+	default:
+		return status.Errorf(codes.InvalidArgument, "invalid first Forward frame type %s", first.GetType())
+	}
+
+	session := &forwardSession{stream: srv, first: first, done: make(chan struct{})}
+	if !s.sessions.deliver(sessionID, session) {
+		s.logger.WithName("forward").Info("rejecting unmatched forward session", "sessionID", sessionID)
+		return status.Error(codes.InvalidArgument, "unknown Forward session")
+	}
+
+	select {
+	case <-session.done:
+		return nil
+	case <-srv.Context().Done():
+		return srv.Context().Err()
+	}
 }

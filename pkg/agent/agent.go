@@ -348,6 +348,8 @@ func (a *agent) receiveCommands(ctx context.Context, logger logr.Logger) (err er
 		}
 
 		switch c := cmd.GetCmd().(type) {
+		case *hostlinkv1.Command_OpenForward:
+			a.handleOpenForward(ctx, c.OpenForward)
 		case *hostlinkv1.Command_Request:
 			a.startRequest(ctx, c.Request, logger)
 		case *hostlinkv1.Command_Chunk:
