@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -61,6 +62,21 @@ func RegisterGRPCService(logger logr.Logger, nodeName string, srv *grpc.Server) 
 	hostlinkv1.RegisterAgentLinkServer(srv, &impl{logger: logger.WithName("service"), nodeName: nodeName, registry: reg, sessions: sessions})
 
 	s := &service{logger: logger, nodeName: nodeName, registry: reg, selfAddr: selfAddr, sessions: sessions}
+	if rawRange := viper.GetString(flagForwardPortRange); rawRange != "" {
+		portRange, parseErr := parsePortRange(rawRange)
+		if parseErr != nil {
+			err = fmt.Errorf("controller: parse %s: %w", flagForwardPortRange, parseErr)
+			return
+		}
+		s.store = newPortStore(logger.WithName("ports"), redis)
+		fwd := newForwarder(logger, reg, sessions, s.store)
+		s.listeners = newListenerManager(logger.WithName("listeners"), fwd.handleConn)
+		fwdCtx, fwdCancel := context.WithCancel(context.Background())
+		s.fwdCancel = fwdCancel
+		s.rangeFrom = portRange.from
+		s.rangeTo = portRange.to
+		go runPortReconciler(fwdCtx, logger.WithName("ports"), s.store, s.listeners)
+	}
 	svc = s
 	if err = s.startPeerPlane(logger.WithName("peer"), reg); err != nil {
 		err = fmt.Errorf("controller: %w", err)
@@ -76,11 +92,16 @@ func RegisterGRPCService(logger logr.Logger, nodeName string, srv *grpc.Server) 
 }
 
 type service struct {
-	logger   logr.Logger
-	nodeName string
-	registry *registry
-	selfAddr string
-	sessions *sessionTable
+	logger    logr.Logger
+	nodeName  string
+	registry  *registry
+	selfAddr  string
+	sessions  *sessionTable
+	store     portStore
+	listeners *listenerManager
+	fwdCancel context.CancelFunc
+	rangeFrom uint32
+	rangeTo   uint32
 
 	peers      *peerClients
 	peerServer *grpc.Server
@@ -132,6 +153,14 @@ func (svc *service) RegisterRoute(mux *gin.Engine) {
 }
 
 func (svc *service) Close() (err error) {
+	if svc.fwdCancel != nil {
+		svc.fwdCancel()
+	}
+	if svc.listeners != nil {
+		if e := svc.listeners.close(); e != nil {
+			err = errors.Join(err, e)
+		}
+	}
 	// GracefulStop drains in-flight relays and makes Serve return; the peerDone
 	// wait below then confirms the serve goroutine fully exited. Trigger it first
 	// so no relay handler is running while dependencies are torn down.
@@ -145,6 +174,11 @@ func (svc *service) Close() (err error) {
 	}
 	if svc.registry != nil {
 		if e := svc.registry.close(); e != nil {
+			err = errors.Join(err, e)
+		}
+	}
+	if svc.store != nil {
+		if e := svc.store.close(); e != nil {
 			err = errors.Join(err, e)
 		}
 	}

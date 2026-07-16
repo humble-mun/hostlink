@@ -27,6 +27,7 @@ const (
 	flagGRPCTLSKeyPath     = "grpc-tls-key-path"
 	flagGRPCTLSCAPath      = "grpc-tls-ca-path"
 	flagRedisURL           = "redis-url"
+	flagForwardPortRange   = "forward-port-range"
 	flagAgentScrapeTimeout = "agent-scrape-timeout"
 	flagGRPCMaxRecvMsgSize = "grpc-max-recv-msg-size"
 
@@ -48,6 +49,7 @@ func RegisterFlags(pfs *pflag.FlagSet) {
 	pfs.String(flagGRPCTLSKeyPath, "", "The path to the private key matching the server certificate.")
 	pfs.String(flagGRPCTLSCAPath, "", "The path to the CA bundle used to verify agent client certificates.")
 	pfs.String(flagRedisURL, "", "The redis connection URL (redis://[user:pass@]host:port/db) backing the cross-pod agent registry. When empty the registry is in-memory only and a request for an agent held by another replica returns 404.")
+	pfs.String(flagForwardPortRange, "", "Public TCP port range reserved for agent port forwarding, e.g. \"1025-2025\" or a single port \"1025\". When empty, port forwarding is disabled and no forward listeners are bound.")
 	pfs.Duration(flagAgentScrapeTimeout, defaultAgentScrapeTimeout, "The per-agent deadline for the metrics fan-out (GET /api/v1/metrics). Keep it below the Prometheus scrape_timeout so a slow agent is skipped rather than failing the whole scrape.")
 	pfs.Int(flagGRPCMaxRecvMsgSize, defaultGRPCMaxRecvMsgSize, "Maximum size in bytes of a single gRPC message the controller accepts from an agent or a sibling controller. Raise it only if an agent returns a very large unary result; the streaming methods are unaffected.")
 
