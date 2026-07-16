@@ -100,7 +100,7 @@ func newForwardTestAgent(fixture *forwardTestFixture) *agent {
 	}
 }
 
-func (f *forwardTestFixture) awaitForward(t *testing.T, ctx context.Context) *forwardTestCall {
+func (f *forwardTestFixture) awaitForward(ctx context.Context, t *testing.T) *forwardTestCall {
 	t.Helper()
 
 	select {
@@ -192,7 +192,7 @@ func TestHandleOpenForwardDialFailure(t *testing.T) {
 		SessionId: sessionID,
 		Target:    closedTCPAddress(t),
 	})
-	call := fixture.awaitForward(t, ctx)
+	call := fixture.awaitForward(ctx, t)
 	frame, err := call.stream.Recv()
 	if err != nil {
 		t.Fatalf("receive reset frame: %v", err)
@@ -217,7 +217,7 @@ func TestHandleOpenForwardEcho(t *testing.T) {
 
 	// When
 	agent.handleOpenForward(ctx, &hostlinkv1.OpenForward{SessionId: sessionID, Target: target})
-	call := fixture.awaitForward(t, ctx)
+	call := fixture.awaitForward(ctx, t)
 	frame, err := call.stream.Recv()
 	if err != nil {
 		t.Fatalf("receive open frame: %v", err)

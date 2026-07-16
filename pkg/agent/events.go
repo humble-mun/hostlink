@@ -65,51 +65,17 @@ func runDockerEventsLoop(ctx context.Context, logger logr.Logger, src dockerEven
 			filters.Arg("event", "die"),
 			filters.Arg("event", "stop"),
 		)})
-		receivedMessage := false
-
-	subscription:
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case message, ok := <-messages:
-				if !ok {
-					logger.V(1).Info("docker event message stream closed")
-					break subscription
-				}
-				receivedMessage = true
-				if message.Actor.ID == "" {
-					logger.V(1).Info("docker event missing container ID", "action", message.Action)
-					continue
-				}
-				if err := send(string(message.Action), message.Actor.ID); err != nil {
-					logger.V(1).Info("send docker event failed", "error", err, "action", message.Action, "containerID", message.Actor.ID)
-				}
-			case err, ok := <-errs:
-				if !ok {
-					logger.V(1).Info("docker event error stream closed")
-				} else {
-					logger.V(1).Info("docker event stream ended", "error", err)
-				}
-				break subscription
-			}
+		receivedMessage, canceled := consumeDockerEvents(ctx, logger, messages, errs, send)
+		if canceled {
+			return
 		}
 
 		if receivedMessage || time.Since(subscriptionStarted) >= retry.healthyAfter {
 			delay = retry.base
 		}
 		logger.V(1).Info("retrying docker event stream", "delay", delay)
-		timer := time.NewTimer(delay)
-		select {
-		case <-ctx.Done():
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
+		if !waitDockerEventRetry(ctx, delay) {
 			return
-		case <-timer.C:
 		}
 		if delay < retry.max {
 			delay *= 2
@@ -117,6 +83,51 @@ func runDockerEventsLoop(ctx context.Context, logger logr.Logger, src dockerEven
 				delay = retry.max
 			}
 		}
+	}
+}
+
+func consumeDockerEvents(ctx context.Context, logger logr.Logger, messages <-chan events.Message, errs <-chan error, send func(eventType, containerID string) error) (receivedMessage, canceled bool) {
+	for {
+		select {
+		case <-ctx.Done():
+			return receivedMessage, true
+		case message, ok := <-messages:
+			if !ok {
+				logger.V(1).Info("docker event message stream closed")
+				return receivedMessage, false
+			}
+			receivedMessage = true
+			if message.Actor.ID == "" {
+				logger.V(1).Info("docker event missing container ID", "action", message.Action)
+				continue
+			}
+			if err := send(string(message.Action), message.Actor.ID); err != nil {
+				logger.V(1).Info("send docker event failed", "error", err, "action", message.Action, "containerID", message.Actor.ID)
+			}
+		case err, ok := <-errs:
+			if !ok {
+				logger.V(1).Info("docker event error stream closed")
+			} else {
+				logger.V(1).Info("docker event stream ended", "error", err)
+			}
+			return receivedMessage, false
+		}
+	}
+}
+
+func waitDockerEventRetry(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	select {
+	case <-ctx.Done():
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 

@@ -167,7 +167,7 @@ func (r *bindingsFakeRedis) MGet(ctx context.Context, keys ...string) *redisv9.S
 	return command
 }
 
-func (r *bindingsFakeRedis) Pipelined(ctx context.Context, fn func(redisv9.Pipeliner) error) ([]redisv9.Cmder, error) {
+func (r *bindingsFakeRedis) Pipelined(_ context.Context, fn func(redisv9.Pipeliner) error) ([]redisv9.Cmder, error) {
 	if err := fn(&bindingsFakePipeline{redis: r}); err != nil {
 		return nil, err
 	}

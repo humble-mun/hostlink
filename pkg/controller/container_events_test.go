@@ -117,6 +117,11 @@ func TestProcessContainerEventStartKeepsMappingSuspendedWhenInspectFails(t *test
 func TestProcessContainerEventIgnoresNilStore(t *testing.T) {
 	// Given
 	svc := &impl{logger: logr.Discard()}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			t.Fatalf("unexpected panic: %v", recovered)
+		}
+	}()
 
 	// When
 	svc.processContainerEvent(context.Background(), nil, &hostlinkv1.DockerEvent{Type: "die", ContainerId: "container-a"})

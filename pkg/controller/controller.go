@@ -87,16 +87,7 @@ func RegisterGRPCService(logger logr.Logger, nodeName string, srv *grpc.Server) 
 		err = fmt.Errorf("controller: %w", err)
 		return
 	}
-	if forwardRangeRaw != "" {
-		fwd := newForwarder(logger, reg, sessions, s.store, s.peers, selfAddr)
-		s.listeners = newListenerManager(logger.WithName("listeners"), fwd.handleConn)
-		s.bindings = newBindingTracker(logger.WithName("bindings"), redis, selfAddr, s.listeners.boundPorts)
-		fwdCtx, fwdCancel := context.WithCancel(context.Background())
-		s.fwdCancel = fwdCancel
-		s.rangeFrom = forwardRange.from
-		s.rangeTo = forwardRange.to
-		go runPortReconciler(fwdCtx, logger.WithName("ports"), s.store, s.listeners, s.bindings)
-	}
+	s.startForwardPlane(logger, redis, forwardRange)
 	svc = s
 
 	if crossPod {
@@ -145,6 +136,21 @@ func (svc *service) startPeerPlane(logger logr.Logger, reg *registry) (err error
 		return
 	}
 	return
+}
+
+func (svc *service) startForwardPlane(logger logr.Logger, redis redisv9.UniversalClient, forwardRange portRange) {
+	if svc.store == nil {
+		return
+	}
+
+	fwd := newForwarder(logger, svc.registry, svc.sessions, svc.store, svc.peers, svc.selfAddr)
+	svc.listeners = newListenerManager(logger.WithName("listeners"), fwd.handleConn)
+	svc.bindings = newBindingTracker(logger.WithName("bindings"), redis, svc.selfAddr, svc.listeners.boundPorts)
+	fwdCtx, fwdCancel := context.WithCancel(context.Background())
+	svc.fwdCancel = fwdCancel
+	svc.rangeFrom = forwardRange.from
+	svc.rangeTo = forwardRange.to
+	go runPortReconciler(fwdCtx, logger.WithName("ports"), svc.store, svc.listeners, svc.bindings)
 }
 
 func (svc *service) RegisterRoute(mux *gin.Engine) {

@@ -105,7 +105,7 @@ func TestForwardPairsWithWaiter(t *testing.T) {
 	t.Cleanup(cancelWaiter)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	stream := openForwardStream(t, ctx, client)
+	stream := openForwardStream(ctx, t, client)
 
 	// When
 	if err := stream.Send(&hostlinkv1.Frame{SessionId: "s1", Type: hostlinkv1.Frame_OPEN}); err != nil {
@@ -136,7 +136,7 @@ func TestForwardPairsWithWaiter(t *testing.T) {
 func TestForwardNoWaiterRejected(t *testing.T) {
 	// Given
 	client, _ := newForwardTestClient(t)
-	stream := openForwardStream(t, context.Background(), client)
+	stream := openForwardStream(context.Background(), t, client)
 
 	// When
 	if err := stream.Send(&hostlinkv1.Frame{SessionId: "unknown", Type: hostlinkv1.Frame_OPEN}); err != nil {
@@ -153,7 +153,7 @@ func TestForwardNoWaiterRejected(t *testing.T) {
 func TestForwardFirstFrameMissingSessionID(t *testing.T) {
 	// Given
 	client, _ := newForwardTestClient(t)
-	stream := openForwardStream(t, context.Background(), client)
+	stream := openForwardStream(context.Background(), t, client)
 
 	// When
 	if err := stream.Send(&hostlinkv1.Frame{Type: hostlinkv1.Frame_OPEN}); err != nil {
@@ -174,7 +174,7 @@ func TestForwardAgentDisconnectClosesRPC(t *testing.T) {
 	t.Cleanup(cancelWaiter)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	stream := openForwardStream(t, ctx, client)
+	stream := openForwardStream(ctx, t, client)
 	if err := stream.Send(&hostlinkv1.Frame{SessionId: "s1", Type: hostlinkv1.Frame_OPEN}); err != nil {
 		t.Fatalf("send OPEN frame: %v", err)
 	}
@@ -206,9 +206,7 @@ func newForwardTestClient(t *testing.T) (hostlinkv1.AgentLinkClient, *sessionTab
 		serverDone <- server.Serve(listener)
 	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), forwardTestTimeout)
-	t.Cleanup(cancel)
-	connection, err := grpc.DialContext(ctx, listener.Addr().String(), grpc.WithBlock(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	connection, err := grpc.NewClient(listener.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		server.Stop()
 		<-serverDone
@@ -226,7 +224,7 @@ func newForwardTestClient(t *testing.T) (hostlinkv1.AgentLinkClient, *sessionTab
 	return hostlinkv1.NewAgentLinkClient(connection), sessions
 }
 
-func openForwardStream(t *testing.T, ctx context.Context, client hostlinkv1.AgentLinkClient) grpc.BidiStreamingClient[hostlinkv1.Frame, hostlinkv1.Frame] {
+func openForwardStream(ctx context.Context, t *testing.T, client hostlinkv1.AgentLinkClient) grpc.BidiStreamingClient[hostlinkv1.Frame, hostlinkv1.Frame] {
 	t.Helper()
 	stream, err := client.Forward(ctx)
 	if err != nil {

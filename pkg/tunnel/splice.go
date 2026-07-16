@@ -50,69 +50,84 @@ func SpliceConn(conn HalfCloser, stream FrameStream) error {
 		}
 		fail(err)
 	}
+	state := spliceState{send: send, fail: fail, reset: reset}
 
 	var workers sync.WaitGroup
 	workers.Add(2)
 	go func() {
 		defer workers.Done()
-		buffer := make([]byte, chunkSize)
-		for {
-			n, readErr := conn.Read(buffer)
-			if n > 0 {
-				data := append([]byte(nil), buffer[:n]...)
-				if err := send(&hostlinkv1.Frame{Type: hostlinkv1.Frame_DATA, Data: data}); err != nil {
-					fail(fmt.Errorf("send frame data: %w", err))
-					return
-				}
-			}
-			if readErr == nil {
-				continue
-			}
-			if errors.Is(readErr, io.EOF) {
-				if err := send(&hostlinkv1.Frame{Type: hostlinkv1.Frame_HALF_CLOSE}); err != nil {
-					fail(fmt.Errorf("send half-close: %w", err))
-				}
-				return
-			}
-			reset(fmt.Errorf("read local connection: %w", readErr))
-			return
-		}
+		spliceConnToStream(conn, state)
 	}()
 	go func() {
 		defer workers.Done()
-		for {
-			frame, recvErr := stream.Recv()
-			if recvErr != nil {
-				reset(fmt.Errorf("receive frame: %w", recvErr))
-				return
-			}
-			switch frame.GetType() {
-			case hostlinkv1.Frame_DATA:
-				if err := writeFrameData(conn, frame.GetData()); err != nil {
-					reset(fmt.Errorf("write local connection: %w", err))
-					return
-				}
-			case hostlinkv1.Frame_HALF_CLOSE:
-				if err := conn.CloseWrite(); err != nil {
-					reset(fmt.Errorf("close local write: %w", err))
-				}
-				return
-			case hostlinkv1.Frame_RESET:
-				fail(errReset)
-				return
-			case hostlinkv1.Frame_OPEN, hostlinkv1.Frame_READY:
-				continue
-			default:
-				reset(fmt.Errorf("unknown frame type %d", frame.GetType()))
-				return
-			}
-		}
+		spliceStreamToConn(conn, stream, state)
 	}()
 	workers.Wait()
 	if firstErr != nil {
 		return firstErr
 	}
 	return closer.close(false)
+}
+
+type spliceState struct {
+	send  func(*hostlinkv1.Frame) error
+	fail  func(error)
+	reset func(error)
+}
+
+func spliceConnToStream(conn HalfCloser, state spliceState) {
+	buffer := make([]byte, chunkSize)
+	for {
+		n, readErr := conn.Read(buffer)
+		if n > 0 {
+			data := append([]byte(nil), buffer[:n]...)
+			if err := state.send(&hostlinkv1.Frame{Type: hostlinkv1.Frame_DATA, Data: data}); err != nil {
+				state.fail(fmt.Errorf("send frame data: %w", err))
+				return
+			}
+		}
+		if readErr == nil {
+			continue
+		}
+		if errors.Is(readErr, io.EOF) {
+			if err := state.send(&hostlinkv1.Frame{Type: hostlinkv1.Frame_HALF_CLOSE}); err != nil {
+				state.fail(fmt.Errorf("send half-close: %w", err))
+			}
+			return
+		}
+		state.reset(fmt.Errorf("read local connection: %w", readErr))
+		return
+	}
+}
+
+func spliceStreamToConn(conn HalfCloser, stream FrameStream, state spliceState) {
+	for {
+		frame, recvErr := stream.Recv()
+		if recvErr != nil {
+			state.reset(fmt.Errorf("receive frame: %w", recvErr))
+			return
+		}
+		switch frame.GetType() {
+		case hostlinkv1.Frame_DATA:
+			if err := writeFrameData(conn, frame.GetData()); err != nil {
+				state.reset(fmt.Errorf("write local connection: %w", err))
+				return
+			}
+		case hostlinkv1.Frame_HALF_CLOSE:
+			if err := conn.CloseWrite(); err != nil {
+				state.reset(fmt.Errorf("close local write: %w", err))
+			}
+			return
+		case hostlinkv1.Frame_RESET:
+			state.fail(errReset)
+			return
+		case hostlinkv1.Frame_OPEN, hostlinkv1.Frame_READY:
+			continue
+		default:
+			state.reset(fmt.Errorf("unknown frame type %d", frame.GetType()))
+			return
+		}
+	}
 }
 
 // SpliceStream bridges two Frame streams (relay hop). Forwards DATA/HALF_CLOSE/RESET

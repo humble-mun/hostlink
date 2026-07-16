@@ -82,7 +82,16 @@ func (f *forwarder) handleConn(ctx context.Context, port uint32, conn *net.TCPCo
 		closed = true
 		return
 	}
+	f.handleLocal(ctx, port, conn, agent, mapping)
+	closed = true
+}
 
+func (f *forwarder) handleLocal(ctx context.Context, port uint32, conn *net.TCPConn, agent *agentConn, mapping portMapping) {
+	abort := func() {
+		if err := rstClose(conn); err != nil {
+			f.logger.Error(err, "reset public connection failed", "port", port)
+		}
+	}
 	sessionID, err := newSessionID()
 	if err != nil {
 		f.logger.Error(err, "generate forward session ID failed", "port", port, "agentID", mapping.AgentID)
@@ -111,7 +120,6 @@ func (f *forwarder) handleConn(ctx context.Context, port uint32, conn *net.TCPCo
 			abort()
 			return
 		}
-		handed = true
 		if err := tunnel.SpliceConn(conn, session.stream); err != nil {
 			f.logger.Error(err, "splice public connection failed", "port", port, "agentID", mapping.AgentID)
 		}

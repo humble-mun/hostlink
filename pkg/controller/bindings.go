@@ -102,30 +102,41 @@ func (t *bindingTracker) states(ctx context.Context, mappings map[uint32]portMap
 	}
 
 	if t.redis == nil {
-		bound := make(map[uint32]struct{})
-		if t.local != nil {
-			for _, port := range t.local() {
-				bound[port] = struct{}{}
-			}
-		}
-		for _, port := range undecided {
-			if _, ok := bound[port]; ok {
-				result[port] = portStateActive
-			}
-		}
+		t.resolveLocalStates(undecided, result)
 		return result, nil
 	}
 
-	pods, err := t.livePods(ctx)
-	if err != nil {
+	if err := t.resolveRedisStates(ctx, undecided, result); err != nil {
 		return nil, err
 	}
+	return result, nil
+}
+
+func (t *bindingTracker) resolveLocalStates(undecided []uint32, result map[uint32]portState) {
+	bound := make(map[uint32]struct{})
+	if t.local != nil {
+		for _, port := range t.local() {
+			bound[port] = struct{}{}
+		}
+	}
+	for _, port := range undecided {
+		if _, ok := bound[port]; ok {
+			result[port] = portStateActive
+		}
+	}
+}
+
+func (t *bindingTracker) resolveRedisStates(ctx context.Context, undecided []uint32, result map[uint32]portState) error {
+	pods, err := t.livePods(ctx)
+	if err != nil {
+		return err
+	}
 	if len(pods) == 0 {
-		return result, nil
+		return nil
 	}
 	bound, err := t.boundSet(ctx, undecided, pods)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	for _, port := range undecided {
 		active := true
@@ -139,7 +150,7 @@ func (t *bindingTracker) states(ctx context.Context, mappings map[uint32]portMap
 			result[port] = portStateActive
 		}
 	}
-	return result, nil
+	return nil
 }
 
 // livePods lists the pod addresses with a fresh controller liveness key.

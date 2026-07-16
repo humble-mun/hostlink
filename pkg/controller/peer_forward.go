@@ -18,39 +18,13 @@ var errForwardReset = errors.New("controller: forward reset by remote")
 
 // Forward establishes a peer-to-peer relay to an agent held by this controller.
 func (s *peerServer) Forward(stream grpc.BidiStreamingServer[hostlinkv1.Frame, hostlinkv1.Frame]) error {
-	firstResult := make(chan firstForwardFrame, 1)
-	go func() {
-		frame, err := stream.Recv()
-		firstResult <- firstForwardFrame{frame: frame, err: err}
-	}()
-
-	timer := time.NewTimer(forwardFirstFrameTimeout)
-	defer timer.Stop()
-	var first *hostlinkv1.Frame
-	select {
-	case result := <-firstResult:
-		if result.err != nil {
-			return status.Errorf(codes.InvalidArgument, "receive opening forward frame: %v", result.err)
-		}
-		first = result.frame
-	case <-timer.C:
-		return status.Error(codes.InvalidArgument, "timed out waiting for opening forward frame")
-	case <-stream.Context().Done():
-		return stream.Context().Err()
+	first, err := receiveAndValidateOpenFrame(stream)
+	if err != nil {
+		return err
 	}
 
-	if first.GetType() != hostlinkv1.Frame_OPEN {
-		return status.Errorf(codes.InvalidArgument, "first forward frame must be OPEN, got %s", first.GetType())
-	}
 	sessionID := first.GetSessionId()
-	if sessionID == "" {
-		return status.Error(codes.InvalidArgument, "opening forward frame is missing session ID")
-	}
 	open := first.GetOpen()
-	if open == nil || open.GetAgentId() == "" || open.GetTarget() == "" {
-		return status.Error(codes.InvalidArgument, "opening forward frame is missing agent ID or target")
-	}
-
 	agentID := open.GetAgentId()
 	conn, ok := s.registry.get(agentID)
 	if !ok {
@@ -71,7 +45,7 @@ func (s *peerServer) Forward(stream grpc.BidiStreamingServer[hostlinkv1.Frame, h
 	if pairTimeout == 0 {
 		pairTimeout = forwardPairTimeout
 	}
-	timer = time.NewTimer(pairTimeout)
+	timer := time.NewTimer(pairTimeout)
 	defer timer.Stop()
 	var session *forwardSession
 	select {
@@ -93,6 +67,41 @@ func (s *peerServer) Forward(stream grpc.BidiStreamingServer[hostlinkv1.Frame, h
 		s.logger.V(1).Info("peer forward streams ended", "agentID", agentID, "sessionID", sessionID, "error", err)
 	}
 	return nil
+}
+
+func receiveAndValidateOpenFrame(stream grpc.BidiStreamingServer[hostlinkv1.Frame, hostlinkv1.Frame]) (*hostlinkv1.Frame, error) {
+	firstResult := make(chan firstForwardFrame, 1)
+	go func() {
+		frame, err := stream.Recv()
+		firstResult <- firstForwardFrame{frame: frame, err: err}
+	}()
+
+	timer := time.NewTimer(forwardFirstFrameTimeout)
+	defer timer.Stop()
+	var first *hostlinkv1.Frame
+	select {
+	case result := <-firstResult:
+		if result.err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "receive opening forward frame: %v", result.err)
+		}
+		first = result.frame
+	case <-timer.C:
+		return nil, status.Error(codes.InvalidArgument, "timed out waiting for opening forward frame")
+	case <-stream.Context().Done():
+		return nil, stream.Context().Err()
+	}
+
+	if first.GetType() != hostlinkv1.Frame_OPEN {
+		return nil, status.Errorf(codes.InvalidArgument, "first forward frame must be OPEN, got %s", first.GetType())
+	}
+	if first.GetSessionId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "opening forward frame is missing session ID")
+	}
+	open := first.GetOpen()
+	if open == nil || open.GetAgentId() == "" || open.GetTarget() == "" {
+		return nil, status.Error(codes.InvalidArgument, "opening forward frame is missing agent ID or target")
+	}
+	return first, nil
 }
 
 // forward opens a relay to the sibling at addr and waits for its READY barrier.
