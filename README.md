@@ -16,11 +16,14 @@
 > directory; a **metrics aggregation** endpoint (`GET /api/v1/metrics`) that
 > streams and merges each agent's configured exporters; the Redis-backed
 > `agent→pod` registry; and cross-pod API relay via the `ControllerPeer` plane
-> (multi-replica HA), including cancel propagation for followed log streams.
-> Still **designed but not yet implemented**: Docker *event* reporting, the
-> controller-side log relay into Loki, port forwarding, and the cross-pod
-> port-forward data plane — see [Roadmap](#roadmap). Do not deploy this as a
-> control plane for real workloads yet.
+> (multi-replica HA), including cancel propagation for followed log streams;
+> and **raw-TCP port forwarding** (`/api/v1/agents/<id>/forwards` — allocate a
+> public port for a container `ip:port`, explicit half-close semantics, a
+> cross-pod relay data plane, an all-replica bind activation barrier, and
+> Docker-event-driven suspend/resume). Still **designed but not yet
+> implemented**: the controller-side log relay into Loki — see
+> [Roadmap](#roadmap). Do not deploy this as a control plane for real
+> workloads yet.
 >
 > Released as **v0.x pre-releases**: the REST API, wire protocol, and
 > configuration may change without notice until v1.0.0.
@@ -59,7 +62,7 @@ A control plane for managing Linux hosts that live **outside the cloud** (on-pre
 
 `hostlink` builds two binaries from a single Go module — **both named `hostlink`**, disambiguated by where they run:
 
-- the **controller** — runs in the cloud, inside Kubernetes, as a container (image `hostlink`). The control plane. It is the gRPC **server**, terminates mutual TLS for agents, and (by design) aggregates metrics, allocates public ports, and routes forwarded TCP across replicas.
+- the **controller** — runs in the cloud, inside Kubernetes, as a container (image `hostlink`). The control plane. It is the gRPC **server**, terminates mutual TLS for agents, aggregates metrics, allocates public ports, and routes forwarded TCP across replicas.
 - the **agent** — runs on each external host as a systemd service (binary `/usr/local/bin/hostlink`). It is the gRPC **client**: it dials out to the controller (so it works behind NAT with no inbound firewall rules), drives the local Docker daemon, reports metrics, and carries tunnels.
 
 > **Naming.** The former `hostlink-controller` name is retired: the controller only ever runs as a container inside Kubernetes and the agent is the only hostlink piece installed on a host, so a bare `hostlink` is unambiguous in each context. Docs use the role names "controller"/"agent"; both binaries read `/etc/humble-mun/hostlink.yaml`.
@@ -92,13 +95,13 @@ external host (behind NAT)                cloud (Kubernetes)
        │ ◄──────────── Command (push) ─────────── │  AgentRequest (images/containers/fs/…) / OpenForward / ExposeRule
        │                                          │
        │── Forward(stream Frame) ───────────────► │  one stream per forwarded TCP conn
-       │     DATA / HALF_CLOSE / RESET           │  (opened by the agent on demand)
+       │     OPEN / DATA / HALF_CLOSE / RESET    │  (opened by the agent on demand)
        │                                          │
 ```
 
 One TCP connection, many HTTP/2 streams. The agent opens the `Control` stream once after connecting; the controller pushes commands down its response direction. Each forwarded public connection gets its own `Forward` stream so gRPC's per-stream flow control gives natural backpressure.
 
-> **What is implemented today:** the mTLS dial, the `Control` stream and `Hello` / `Heartbeat` exchange; the generic `AgentRequest`/`AgentResult` dispatch envelope with the Docker **images** endpoints — `GET` (list), `POST` (pull, streaming SSE progress), and `DELETE` (remove) on `/api/v1/agents/<id>/images`; the Docker **containers** endpoints on `/api/v1/agents/<id>/containers` — list, create-and-start (docker run semantics), inspect, start/stop/restart, remove, and an SSE **log stream** (`.../logs`, `?follow` supported, client disconnect cancels the agent-side stream via `request.cancel`); the agent **working-directory filesystem** API (`GET`/`POST`/`PUT`/`DELETE /api/v1/agents/<id>/files`); the **metrics aggregation** endpoint (`GET /api/v1/metrics`) that reverse-pulls, labels, and merges each agent's configured exporters; the Redis `agent→pod` registry; and cross-pod relay of API requests via `ControllerPeer.Dispatch` (unary), `ControllerPeer.DispatchStream` (streaming), and `ControllerPeer.Upload` (client-streaming, for filesystem writes). `Forward`, Docker **event** reporting, and the cross-pod port-forward data plane are stubs or unimplemented. See [Roadmap](#roadmap).
+> **What is implemented today:** the mTLS dial, the `Control` stream and `Hello` / `Heartbeat` exchange; the generic `AgentRequest`/`AgentResult` dispatch envelope with the Docker **images** endpoints — `GET` (list), `POST` (pull, streaming SSE progress), and `DELETE` (remove) on `/api/v1/agents/<id>/images`; the Docker **containers** endpoints on `/api/v1/agents/<id>/containers` — list, create-and-start (docker run semantics), inspect, start/stop/restart, remove, and an SSE **log stream** (`.../logs`, `?follow` supported, client disconnect cancels the agent-side stream via `request.cancel`); the agent **working-directory filesystem** API (`GET`/`POST`/`PUT`/`DELETE /api/v1/agents/<id>/files`); the **metrics aggregation** endpoint (`GET /api/v1/metrics`) that reverse-pulls, labels, and merges each agent's configured exporters; the Redis `agent→pod` registry; cross-pod relay of API requests via `ControllerPeer.Dispatch` (unary), `ControllerPeer.DispatchStream` (streaming), and `ControllerPeer.Upload` (client-streaming, for filesystem writes); and **port forwarding** end to end — the `forwards` REST API allocating public ports from `--forward-port-range`, per-port TCP listeners reconciled on every replica, the `OpenForward` reverse-open handshake with the `pkg/tunnel` half-close-correct byte pipe, the cross-pod `ControllerPeer.Forward` relay with stale-holder retry, the all-replica bind **activation barrier** (`pending`/`active`/`suspended`), and Docker **event**-driven suspend/resume of exposures. The controller-side Loki log relay is not yet implemented. See [Roadmap](#roadmap).
 
 ---
 
@@ -120,7 +123,7 @@ The agent is the gRPC **client**; the controller has the public entrypoint and i
 
 On connect, the agent opens `Control(stream AgentEvent) returns (stream Command)`. The controller pushes commands down the `Command` stream; the agent reports its handshake, heartbeats, and Docker events up the `AgentEvent` stream.
 
-Most controller→agent work rides the generic **`AgentRequest`** envelope: `method` names the operation (`images.*`, `containers.*`, `fs.*`, `metrics.scrape`), `payload` is method-specific JSON, and the reply (`AgentResult`, plus `AgentProgress` frames for streaming methods) is correlated by `request_id`. A fire-and-forget `request.cancel` meta method cancels an in-flight streaming request — this is what tears down a followed log stream when its HTTP client goes away. Container lifecycle is implemented through this plane (the `containers.*` methods); the `DockerOp` command in the proto is an unused legacy placeholder. `OpenForward` and `ExposeRule` (port forwarding) are designed but not implemented.
+Most controller→agent work rides the generic **`AgentRequest`** envelope: `method` names the operation (`images.*`, `containers.*`, `fs.*`, `metrics.scrape`), `payload` is method-specific JSON, and the reply (`AgentResult`, plus `AgentProgress` frames for streaming methods) is correlated by `request_id`. A fire-and-forget `request.cancel` meta method cancels an in-flight streaming request — this is what tears down a followed log stream when its HTTP client goes away. Container lifecycle is implemented through this plane (the `containers.*` methods); the `DockerOp` command in the proto is an unused legacy placeholder. `OpenForward` sits outside the envelope: it tells the agent to dial a target and open a `Forward` stream (see [Port Forwarding](#port-forwarding)). `ExposeRule` remains an unused placeholder.
 
 ### Metrics: two endpoints, two concerns
 
@@ -157,24 +160,27 @@ Because the server cannot open a stream to the agent, the stream-open handshake 
 
 1. A public connection lands on the controller's exposed port.
 2. The controller pushes `OpenForward{session_id, target}` down that agent's `Control` stream.
-3. The agent **opens** a `Forward` stream, first frame carrying `session_id`.
+3. The agent **opens** a `Forward` stream whose first frame is a typed `OPEN` frame carrying `session_id` (on a failed local dial it sends `RESET` with the `session_id` instead).
 4. The controller **pairs** the public connection with that `Forward` stream by `session_id` and relays bidirectionally.
 
-This handshake + chunking + session pairing is provided by [`openconfig/grpctunnel`](https://github.com/openconfig/grpctunnel) — do not rebuild it.
+This handshake + chunking + session pairing is implemented in-repo: `pkg/tunnel` is the byte pipe, and the controller pairs streams by `session_id`. [`openconfig/grpctunnel`](https://github.com/openconfig/grpctunnel) was evaluated and dropped in favor of this small, fully-tested implementation.
 
-> **Constraint (half-close, the correctness crux):** a gRPC stream's own lifecycle (`CloseSend` / handler return) cannot represent TCP's independent per-direction half-close. It is modeled with **explicit frame types**: local EOF → send `HALF_CLOSE` and stop sending that direction but keep reading the other; receive `HALF_CLOSE` → `CloseWrite()` the local socket; `RESET` → `SetLinger(0)` + `Close()`. Before integrating `openconfig/grpctunnel`, **verify** its byte pipe fully preserves half-close; if not, patch it.
+> **Constraint (half-close, the correctness crux):** a gRPC stream's own lifecycle (`CloseSend` / handler return) cannot represent TCP's independent per-direction half-close. It is modeled with **explicit frame types**: local EOF → send `HALF_CLOSE` and stop sending that direction but keep reading the other; receive `HALF_CLOSE` → `CloseWrite()` the local socket; `RESET` → `SetLinger(0)` + `Close()`. `pkg/tunnel` implements exactly this contract and its half-close semantics are locked by tests — keep them intact when touching it.
 
 > **Constraint (backpressure):** never read from the local socket faster than you can `Send`. Rely on `Send` blocking when the HTTP/2 flow-control window is full. Do not buffer without bound.
+
+> **Implementation status: implemented end to end.** `--forward-port-range` (chart: `portForward.range`) reserves the public pool; every replica binds every exposed port and reconciles its listeners from the shared store (5s tick + a pub/sub nudge); a suspended exposure answers new connections with an immediate RST.
 
 ### Multi-replica Affinity
 
 The controller runs ≥2 replicas for HA. An agent's connection is pinned to the one pod it dialed, but public TCP arriving through the L4 load balancer lands on **any** replica — usually not the one holding that agent.
 
 - **Routing key:** for raw TCP the only ingress key is the **destination port**. Each exposure = one distinct public port.
-- **Registry (Redis dual maps):** `port:<P>` → `(agentID, container_target)`; `agent:<id>` → `holding_pod` (written when the agent attaches, **TTL refreshed by heartbeat**, deleted on disconnect).
-- **Atomic port allocation:** take a free port from a reserved pool via Redis `INCR` / `SETNX`.
-- **Routing flow:** a public connection reaches pod B on port P → B looks up `port:P` → agentX, then `agent:agentX` → podA. If `podA == B`, B drives the reverse-open directly; otherwise B forwards the connection to podA over **internal gRPC** (two byte-pipe hops in series; half-close must propagate end to end).
-- **Stale window:** because the LB spreads connections, cross-pod forwarding is the **common** case (hit rate ≈ 1/N). A pod that receives "forwarded to me but I don't hold agentX" must **reject** and have the caller re-resolve and retry.
+- **Registry (Redis dual maps):** `hostlink:port:<P>` → JSON `{agent_id, target, container_id?, suspended?}` (no TTL — an exposure survives agent churn until deleted); `hostlink:agent:<id>` → `holding_pod` (written when the agent attaches, **TTL refreshed by heartbeat**, deleted on disconnect).
+- **Atomic port allocation:** free-port candidates are found with batched `MGET` over the reserved range, then claimed atomically via `SETNX` (in-memory store in single-replica mode).
+- **Routing flow:** a public connection reaches pod B on port P → B looks up `port:P` → agentX, then `agent:agentX` → podA. If `podA == B`, B drives the reverse-open directly; otherwise B opens `ControllerPeer.Forward` to podA, first frame `OPEN{session_id, open:{agent_id, target}}` — podA pairs it with the agent's `Forward` stream and answers `READY` **before** B reads any public bytes (retry-before-read). Two byte-pipe hops in series; half-close propagates end to end.
+- **Stale window:** because the LB spreads connections, cross-pod forwarding is the **common** case (hit rate ≈ 1/N). A pod that receives "forwarded to me but I don't hold agentX" **rejects** with `FAILED_PRECONDITION`; the caller re-resolves the holder once and retries.
+- **Activation barrier:** kube-proxy does not retry a connection-refused backend, so a Service selecting all controller pods must not include port P until **every** live replica has bound it. Each replica reports `hostlink:bound:<P>:<pod>` (30s TTL) alongside a liveness key `hostlink:controller:<pod>` (45s TTL); a forward is `active` only when all live pods report the bind, `pending` otherwise, and `suspended` while its container is down.
 
 > Redis is already in the stack. Raft/gossip/mesh were evaluated and rejected: `agent→pod` is not contended state and needs no consensus.
 
@@ -184,8 +190,8 @@ The controller runs ≥2 replicas for HA. An agent's connection is pinned to the
 
 Exposure rules are tied to lifecycle via `client.Events()`:
 
-- on `stop` / `die` → suspend or remove that container's exposure (clear the Redis `port:` mapping).
-- on `start` → re-resolve the container IP and re-establish exposure.
+- on `stop` / `die` → **suspend** that container's exposures: the mapping is marked `suspended`, the port and listeners are retained, and new connections get an immediate RST.
+- on `start` → re-inspect the container, re-resolve its network IP, rewrite the mapping target, and clear the suspension — the public port does not change.
 
 > The container IP can change after restart; if the port is re-allocated by the new holder, the **public port changes and clients must reconnect** — an accepted design tradeoff. For GPU containers, remember the nvidia runtime; `docker pause` / `unpause` (freezer cgroup, keeps RAM/VRAM) is a distinct "suspend, resume instantly" semantic.
 
@@ -202,9 +208,10 @@ service AgentLink {
   // client, so all server->agent commands travel over this already-open stream.
   rpc Control(stream AgentEvent) returns (stream Command);
 
-  // One per forwarded public TCP connection; opened by the agent, first frame
-  // carries session_id for pairing. Internal cross-pod forwarding reuses this
-  // same service definition (just dialed to a sibling pod).
+  // One per forwarded public TCP connection; opened by the agent. The first
+  // frame is a typed OPEN frame carrying session_id for pairing (or RESET with
+  // the session_id when the agent's local dial fails). Cross-pod forwarding
+  // uses ControllerPeer.Forward, not this RPC.
   rpc Forward(stream Frame) returns (stream Frame);
 }
 
@@ -222,6 +229,14 @@ service ControllerPeer {
   // Client-streaming relay of a controller->agent upload (e.g. fs.write): the
   // first UploadFrame carries the open (DispatchRequest), the rest body chunks.
   rpc Upload(stream UploadFrame) returns (AgentResult);
+
+  // Cross-pod data plane for port forwarding: the pod that accepted the public
+  // TCP connection opens this stream to the pod holding the agent. The first
+  // frame is OPEN with session_id + open{agent_id, target}; the holder pairs it
+  // with the agent's Forward stream and answers READY before any public bytes
+  // flow (retry-before-read). A stale holder rejects with FAILED_PRECONDITION
+  // so the caller re-resolves and retries.
+  rpc Forward(stream Frame) returns (stream Frame);
 }
 ```
 
@@ -234,7 +249,8 @@ service ControllerPeer {
 | `AgentProgress{request_id, payload}` | agent → controller | A non-terminal progress update for a long-running `AgentRequest` (e.g. `images.pull` layer status, or `fs.read` file bytes); `payload` is method-specific. The op still completes with a `final` `AgentResult` |
 | `DispatchRequest{agent_id, AgentRequest}` | controller → controller | Wraps an `AgentRequest` with the routing key for the `ControllerPeer` hop (`Dispatch` unary, `DispatchStream` streaming) |
 | `UploadFrame{open / chunk, last}` | controller → controller | Streams a controller→agent upload across the `ControllerPeer.Upload` hop: the first frame carries the `DispatchRequest` open, the rest carry body chunks |
-| `Frame{session_id, type, data}` | both (per forward) | Raw TCP bytes; `type` ∈ `DATA` / `HALF_CLOSE` / `RESET` |
+| `Frame{session_id, type, data, open}` | both (per forward) | Raw TCP bytes; `type` ∈ `DATA` / `HALF_CLOSE` / `RESET` / `OPEN` / `READY`. The first frame of a stream is `OPEN` carrying `session_id` (`READY` acks the peer hop; `RESET` as a first frame reports a failed dial) |
+| `PeerForwardOpen{agent_id, target}` | controller → controller | Routing payload on the first `OPEN` frame of a `ControllerPeer.Forward` relay: which agent to reverse-open and which `ip:port` it should dial |
 
 The `Frame.Type` enum is what makes correct TCP half-close possible (see [Port Forwarding](#port-forwarding)). Regenerate and commit the generated code after any `.proto` change.
 
@@ -261,6 +277,10 @@ The controller serves a small REST surface on its in-cluster default listener, o
 | `POST /api/v1/agents/<agentId>/files?path=<p>` | `&dir=true` creates a directory (`fs.mkdir`, `409` if it exists). Otherwise uploads one or more files from a **multipart form**, streamed to the agent in chunks (`fs.write`) and created **exclusively** — an existing target is reported per-file. Response `{"written":[...],"errors":[...]}`. |
 | `PUT /api/v1/agents/<agentId>/files?path=<p>` | Overwrite a single file with the request body (raw bytes, or the first multipart part); streamed via `fs.write` (truncate). |
 | `DELETE /api/v1/agents/<agentId>/files?path=<p>` | Remove the path, **recursively** for directories (`fs.remove`). |
+| `POST /api/v1/agents/<agentId>/forwards` | Allocate a public port that forwards raw TCP to a container `ip:port` on the agent. JSON body `{"target":"<ip:port>","container_id":"..."}` (`container_id` optional, ties the forward to container lifecycle events). Returns `201` with the mapping incl. `port` and `state` (starts `pending`; poll until `active` before wiring external infrastructure to it). `409` when the reserved range is exhausted, `503` when `--forward-port-range` is unset. |
+| `GET /api/v1/agents/<agentId>/forwards` | List the agent's port forwards, each with its `state`: `pending` (not yet bound on every live replica), `active` (safe to expose), or `suspended` (container down; connections are refused). |
+| `GET /api/v1/forwards` | List all port forwards across agents. |
+| `DELETE /api/v1/forwards/<port>` | Release a forwarded public port. `204` on success, `404` for an unknown port. |
 
 > The `files` endpoints stream both directions in 64 KB chunks (download via `AgentProgress` frames, upload via `AgentRequestChunk` / the `ControllerPeer.Upload` relay), so large files transfer with bounded memory. The agent resolves every `path` inside its working directory and rejects traversal (`..`) outside it.
 
@@ -276,7 +296,7 @@ The controller serves a small REST surface on its in-cluster default listener, o
 | Controller runtime | Kubernetes (StatefulSet; default 1 replica, ≥2 for HA) |
 | Agent runtime | A Linux host reachable *outbound* to the controller; systemd |
 | Docker (on each host) | Required — workloads are Docker containers; nvidia runtime for GPU |
-| Redis | The `agent→pod` registry — optional for a single replica, **required for HA** (`replicaCount > 1`) |
+| Redis | The `agent→pod` registry + the port-forward exposure map — optional for a single replica, **required for HA** (`replicaCount > 1`) |
 | cert-manager + CSI driver | Optional — issues controller/peer certs per-pod instead of mounting Secrets |
 | node_exporter | Sidecar on each host, listening on `127.0.0.1:9100` |
 
@@ -349,6 +369,7 @@ All flags can also be set via environment variables: uppercase the flag, replace
 | `--peer-tls-server-name` | — | Server name to verify a sibling against when relaying; empty = the dialed peer host |
 | `--agent-scrape-timeout` | `5s` | Per-agent deadline for the `GET /api/v1/metrics` fan-out; keep it below the Prometheus `scrape_timeout` |
 | `--grpc-max-recv-msg-size` | 16 MiB | Ceiling for a single gRPC message received from an agent or sibling (large unary results; streaming methods chunk and are unaffected) |
+| `--forward-port-range` | — | Public TCP port range reserved for port forwarding, as `from-to` (e.g. `1025-2025`) or a single port. Every replica binds every allocated port in this range. Empty = port forwarding disabled (the `forwards` API returns 503) |
 
 > `--redis-url` and `--peer-bind-address` are the two halves of one cross-pod switch: set both (plus `--peer-advertise-address`) or neither. The controller refuses to start half-configured.
 
@@ -365,8 +386,8 @@ The controller also inherits the chassis HTTP server flags (`--http-bind-address
   1. an **mTLS gRPC listener** (`--grpc-bind-address` + `WithTLSCert` + `WithMTLS`) that agents dial out to; exposed externally through the ingress.
   2. a **plaintext (h2c) default listener**, bound in-cluster only, serving the REST API (`/api/v1/...`, including the aggregated agent metrics at `/api/v1/metrics`), the controller's own `/metrics`, `/probe`, `/version`, `/logging`.
   3. (when `peer.enabled`) an **in-cluster ControllerPeer mTLS listener** on its own `grpc.Server` — separate from the shared chassis server so the relay plane is never reachable from the agent-facing/ingress listener.
-- **Ingress (L4 LoadBalancer):** the mTLS gRPC port for agent dial-out. Because the controller terminates mTLS itself, the Ingress MUST do L4/TLS **passthrough** (asserted explicitly via controller-specific annotations) — terminating TLS would strip the agent client certificate and break the identity model. A **reserved TCP port range** (e.g. `1025–2025`) for tunnel exposure is design-only and the chart does not open it yet.
-- **Dependencies:** **Redis** backs the `agent→pod` registry (optional single-replica, required for HA); the cross-pod relay of API requests rides the ControllerPeer plane. The `port:<P>` map + port allocation and the cross-pod port-forward data plane are still design-only.
+- **Ingress (L4 LoadBalancer):** the mTLS gRPC port for agent dial-out. Because the controller terminates mTLS itself, the Ingress MUST do L4/TLS **passthrough** (asserted explicitly via controller-specific annotations) — terminating TLS would strip the agent client certificate and break the identity model. The reserved TCP port range for tunnel exposure is configured via `portForward.range`; with `portForward.service.enabled` the chart renders a dedicated `<release>-forward` Service that enumerates every port in the range (Kubernetes Service ports are a list, not a range — mind your cloud LB listener quotas).
+- **Dependencies:** **Redis** backs the `agent→pod` registry, the `port:<P>` exposure map, and the bind/liveness keys behind the forward activation barrier (optional single-replica, required for HA); the cross-pod relay of API requests rides the ControllerPeer plane, and the cross-pod port-forward data plane rides `ControllerPeer.Forward`.
 - **Certificates:** per plane, from a mounted Secret (`grpc.tlsSecretName` / `peer.tlsSecretName`) or, with `certManager.enabled`, issued per-pod by the **cert-manager CSI driver** from a configured `Issuer`/`ClusterIssuer` (`certManager.issuerKind` / `issuerName`).
 
 > **Bypass note.** The chassis server applies the same handler to every listener, so the plaintext default listener would also accept gRPC. The split relies on **network-layer isolation** — the default listener is reachable only inside the cluster, while agent gRPC is exposed solely through the mTLS listener via the ingress.
@@ -390,7 +411,7 @@ Keep the Prometheus job's `scrape_timeout` **above** the controller's `--agent-s
 
 - **Form:** a static Go binary (`/usr/local/bin/hostlink`) running as a **systemd service**. The unit and an example config ship in `deploy/` (`deploy/hostlink.service`, `deploy/hostlink.yaml`).
 - **Configuration:** the agent reads all settings from `/etc/humble-mun/hostlink.yaml` (chassis viper `SetConfigName("hostlink")` + `AddConfigPath("/etc/humble-mun")`; YAML keys are the flag names verbatim, each overridable by an `HM_*` env var). The systemd unit passes **no** command-line flags, and viper `WatchConfig` reloads the file at runtime, so changing config needs neither `systemctl daemon-reload` nor a unit edit.
-- **Behavior:** dials out to the controller's public gRPC endpoint over mTLS and runs the `Control` stream (`Hello` + periodic `Heartbeat`), reconnecting **in-process** with exponential backoff + jitter (and HTTP/2 keepalive) so a controller redeploy is ridden out without a process restart. It serves controller-pushed `AgentRequest`s via a lazy `client.FromEnv` Docker client: the Docker **images** methods (`images.list` / `images.pull` / `images.remove`), the **container** methods (`containers.list` / `containers.create` / `containers.inspect` / `containers.start` / `containers.stop` / `containers.restart` / `containers.remove` / `containers.logs`), and the **filesystem** methods (`fs.stat` / `fs.list` / `fs.read` / `fs.write` / `fs.mkdir` / `fs.remove`) over the configured `--data-dir` working directory. Docker *event* reporting, carrying tunnels, and the node_exporter sidecar on `127.0.0.1:9100` are planned (see [Roadmap](#roadmap)). Because the Docker client is lazy, the unit treats `docker.service` as a soft (`Wants`) ordering dependency, not a hard requirement.
+- **Behavior:** dials out to the controller's public gRPC endpoint over mTLS and runs the `Control` stream (`Hello` + periodic `Heartbeat`), reconnecting **in-process** with exponential backoff + jitter (and HTTP/2 keepalive) so a controller redeploy is ridden out without a process restart. It serves controller-pushed `AgentRequest`s via a lazy `client.FromEnv` Docker client: the Docker **images** methods (`images.list` / `images.pull` / `images.remove`), the **container** methods (`containers.list` / `containers.create` / `containers.inspect` / `containers.start` / `containers.stop` / `containers.restart` / `containers.remove` / `containers.logs`), and the **filesystem** methods (`fs.stat` / `fs.list` / `fs.read` / `fs.write` / `fs.mkdir` / `fs.remove`) over the configured `--data-dir` working directory. It also watches Docker container lifecycle events (`start` / `die` / `stop`) and reports them up the `Control` stream (driving exposure suspend/resume), and carries forwarded TCP: on `OpenForward` it dials the target and opens a `Forward` stream. The node_exporter sidecar on `127.0.0.1:9100` is a deployment expectation for the metrics fan-out. Because the Docker client is lazy, the unit treats `docker.service` as a soft (`Wants`) ordering dependency, not a hard requirement.
 - **Network:** behind NAT; only needs **outbound** reachability to the controller.
 
 ---
@@ -410,7 +431,7 @@ Items below are **non-negotiable** — do not deviate during implementation.
 
 - **mTLS, no fallback** — agent↔controller is always mutual TLS 1.3+. The default listener stays in-cluster only.
 - **No TCP-over-TCP** — the L4 proxy terminates TCP and carries bytes; do **not** switch to L3 packet tunneling over TCP.
-- **Half-close is explicit** — forwarding must do chunking + explicit `HALF_CLOSE` / `RESET` frames + backpressure. Verify `openconfig/grpctunnel` preserves half-close before integrating.
+- **Half-close is explicit** — forwarding does chunking + explicit `HALF_CLOSE` / `RESET` frames + backpressure. `pkg/tunnel` implements this contract and tests lock it; keep the semantics intact when touching it.
 - **Never concatenate expositions** — merge metrics at the `MetricFamily` level; per-agent scrape deadline < `scrape_timeout`; skip slow agents.
 - **Reject stale forwards** — a wrong-pod forward must be rejected and retried.
 - **One TCP connection, many streams** — never build a sub-mux on top of HTTP/2.
@@ -420,7 +441,7 @@ Items below are **non-negotiable** — do not deviate during implementation.
 ### Explicitly rejected (do not adopt)
 
 - **KubeEdge / treating hosts as K8s nodes** — the premise is Docker containers, not pods.
-- **`jhump/grpctunnel`** — it tunnels gRPC-over-gRPC, not raw TCP. Wrong fit; use `openconfig/grpctunnel`.
+- **`jhump/grpctunnel`** — it tunnels gRPC-over-gRPC, not raw TCP. Wrong fit. (`openconfig/grpctunnel` was evaluated too and dropped in favor of the small in-repo `pkg/tunnel` pipe with explicit half-close.)
 - **Self-built tun device + userspace netstack** — only L4 forwarding is needed now; an L3 VPN is a future, WireGuard-family decision.
 - **Raft / consensus between replicas** — `agent→pod` is not contended state.
 - **`master` / `minion` naming.**
@@ -444,14 +465,12 @@ Items below are **non-negotiable** — do not deviate during implementation.
 - [x] Metrics aggregation: agent `scrape-targets` (node_exporter / dcgm / …) pulled on demand and **streamed** back; controller `GET /api/v1/metrics` bounded-concurrency reverse fan-out + `agent`/`exporter` label injection + `MetricFamily` merge + synthesized `agent_up` / `hostlink_scrape_target_up`, cross-pod aware via `ControllerPeer.DispatchStream`
 - [x] Container CRUD + lifecycle on `/api/v1/agents/<id>/containers` (`containers.list` / `containers.create` with docker run semantics incl. ports, binds, `--net`/`--pid` host modes, restart policy / `containers.inspect` / `containers.start` / `containers.stop` / `containers.restart` / `containers.remove`)
 - [x] Container **log streaming** (`.../containers/<id>/logs`, SSE, `?follow`/`?tail`/`?since`/`?timestamps`): TTY-aware stdout/stderr demux, line framing, lossless delivery; plus the `request.cancel` meta method so an abandoned followed stream is torn down on the agent, propagated across pods
+- [x] Port forwarding end to end: `--forward-port-range` port pool (Redis `SETNX` allocation, in-memory single-replica mode) + the `forwards` REST API; per-port TCP listeners reconciled on **every** replica; the `OpenForward` reverse-open handshake and the `pkg/tunnel` byte pipe with explicit half-close (`OPEN` / `READY` / `DATA` / `HALF_CLOSE` / `RESET`); cross-pod two-hop relay via `ControllerPeer.Forward` with stale-holder reject-and-retry; the all-replica bind **activation barrier** surfacing `pending` / `active` / `suspended` per forward; chart `portForward.range` + optional enumerated `<release>-forward` Service
+- [x] Docker **event** reporting (`DockerEvent`: container `start` / `die` / `stop`) driving exposure lifecycle — suspend on `die` / `stop` (fast RST, port retained), re-resolve the container IP and resume on `start`
 
 ### In Progress / Planned (MVP)
 
-- [ ] Docker **event** reporting (`DockerEvent`: container start/stop/die driving exposure lifecycle)
 - [ ] Controller-side **log relay into Loki** ("Plan B" — agents can only reach the controller, so a relay follows `containers.logs` per held agent, labels `{agent_id, container_name}`, and pushes to in-cluster Alloy `loki.source.api`; needs `since`-based resume, ownership follow-on-reconnect, and Control-stream bandwidth budgeting)
-- [ ] Port forwarding: integrate `openconfig/grpctunnel` (verify half-close first); `ExposeRule` / `OpenForward`; `Frame` relay with half-close + backpressure (`Forward` is currently a stub)
-- [ ] Multi-replica **port forwarding**: the `port:<P>` map + atomic port-pool allocation, and the cross-pod two-hop relay of the port-forward data plane (the API-request relay already exists)
-- [ ] Lifecycle coupling: Docker events drive exposure establish / suspend / re-establish
 - [ ] `internal/` decomposition into `{transport, tunnel, registry, metrics, docker, routing}` behind interfaces
 
 ### Future
