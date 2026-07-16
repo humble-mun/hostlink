@@ -233,6 +233,43 @@ func TestPortStoreWatch(t *testing.T) {
 	}
 }
 
+func TestMemPortStoreUpdate(t *testing.T) {
+	// Given
+	store := newMemPortStore()
+	ctx := context.Background()
+	port, err := store.allocate(ctx, 7100, 7100, testPortMapping("agent-a"))
+	if err != nil {
+		t.Fatalf("allocate port: %v", err)
+	}
+	changes, stop := store.watch()
+	defer stop()
+	updated := portMapping{AgentID: "agent-a", Target: "172.30.1.9:8080", Suspended: true}
+
+	// When
+	err = store.update(ctx, port, updated)
+	got, lookupErr := store.lookup(ctx, port)
+	missingErr := store.update(ctx, 7101, updated)
+
+	// Then
+	if err != nil {
+		t.Fatalf("update allocated port: %v", err)
+	}
+	if lookupErr != nil {
+		t.Fatalf("lookup updated port: %v", lookupErr)
+	}
+	if got != updated {
+		t.Fatalf("updated mapping = %#v, want %#v", got, updated)
+	}
+	if !errors.Is(missingErr, errPortNotFound) {
+		t.Fatalf("update missing port error = %v, want %v", missingErr, errPortNotFound)
+	}
+	select {
+	case <-changes:
+		t.Fatal("update notified port-store watchers")
+	case <-time.After(25 * time.Millisecond):
+	}
+}
+
 func TestParsePortRange(t *testing.T) {
 	tests := []struct {
 		input   string

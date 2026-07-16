@@ -31,6 +31,14 @@ func RegisterGRPCService(logger logr.Logger, nodeName string, srv *grpc.Server) 
 	selfAddr := viper.GetString(flagPeerAdvertiseAddress)
 	redisURL := viper.GetString(flagRedisURL)
 	peerBind := viper.GetString(flagPeerBindAddress)
+	forwardRangeRaw := viper.GetString(flagForwardPortRange)
+	var forwardRange portRange
+	if forwardRangeRaw != "" {
+		if forwardRange, err = parsePortRange(forwardRangeRaw); err != nil {
+			err = fmt.Errorf("controller: parse %s: %w", flagForwardPortRange, err)
+			return
+		}
+	}
 
 	// redis (the agent->pod directory) and the peer listener (the relay transport)
 	// are the two halves of one cross-pod switch: one without the other can neither
@@ -59,26 +67,33 @@ func RegisterGRPCService(logger logr.Logger, nodeName string, srv *grpc.Server) 
 
 	reg := newRegistry(logger.WithName("registry"), redis, selfAddr)
 	sessions := newSessionTable()
-	hostlinkv1.RegisterAgentLinkServer(srv, &impl{logger: logger.WithName("service"), nodeName: nodeName, registry: reg, sessions: sessions})
+	var store portStore
+	if forwardRangeRaw != "" {
+		store = newPortStore(logger.WithName("ports"), redis)
+	}
 
-	s := &service{logger: logger, nodeName: nodeName, registry: reg, selfAddr: selfAddr, sessions: sessions}
+	s := &service{logger: logger, nodeName: nodeName, registry: reg, selfAddr: selfAddr, sessions: sessions, store: store}
+	defer func() {
+		if err == nil {
+			return
+		}
+		if closeErr := s.Close(); closeErr != nil {
+			logger.Error(closeErr, "close controller after setup failure")
+		}
+	}()
+	hostlinkv1.RegisterAgentLinkServer(srv, &impl{logger: logger.WithName("service"), nodeName: nodeName, registry: reg, sessions: sessions, store: store})
+
 	if err = s.startPeerPlane(logger.WithName("peer"), reg); err != nil {
 		err = fmt.Errorf("controller: %w", err)
 		return
 	}
-	if rawRange := viper.GetString(flagForwardPortRange); rawRange != "" {
-		portRange, parseErr := parsePortRange(rawRange)
-		if parseErr != nil {
-			err = fmt.Errorf("controller: parse %s: %w", flagForwardPortRange, parseErr)
-			return
-		}
-		s.store = newPortStore(logger.WithName("ports"), redis)
+	if forwardRangeRaw != "" {
 		fwd := newForwarder(logger, reg, sessions, s.store, s.peers, selfAddr)
 		s.listeners = newListenerManager(logger.WithName("listeners"), fwd.handleConn)
 		fwdCtx, fwdCancel := context.WithCancel(context.Background())
 		s.fwdCancel = fwdCancel
-		s.rangeFrom = portRange.from
-		s.rangeTo = portRange.to
+		s.rangeFrom = forwardRange.from
+		s.rangeTo = forwardRange.to
 		go runPortReconciler(fwdCtx, logger.WithName("ports"), s.store, s.listeners)
 	}
 	svc = s

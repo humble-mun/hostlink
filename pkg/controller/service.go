@@ -22,6 +22,7 @@ type impl struct {
 	nodeName string
 	registry *registry
 	sessions *sessionTable
+	store    portStore
 }
 
 // Control runs the bidirectional command stream. On the agent's Hello it registers
@@ -85,10 +86,11 @@ func (s *impl) handleAgentEvent(conn *agentConn, srv grpc.BidiStreamingServer[ho
 			s.registry.refresh(conn.agentID)
 		}
 	case *hostlinkv1.AgentEvent_Event:
-		eventLogger.Info("agent docker event received",
+		eventLogger.V(1).Info("agent docker event received",
 			"type", kind.Event.GetType(),
 			"containerID", kind.Event.GetContainerId(),
 		)
+		s.handleContainerEvent(conn, kind.Event)
 	case *hostlinkv1.AgentEvent_Result:
 		if conn == nil {
 			eventLogger.Info("dropping agent result before registration", "requestID", kind.Result.GetRequestId())

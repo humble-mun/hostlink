@@ -70,6 +70,11 @@ func (f *forwarder) handleConn(ctx context.Context, port uint32, conn *net.TCPCo
 		abort()
 		return
 	}
+	if mapping.Suspended {
+		f.logger.Info("public connection has suspended port mapping", "port", port, "agentID", mapping.AgentID)
+		abort()
+		return
+	}
 
 	agent, local := f.registry.get(mapping.AgentID)
 	if !local {

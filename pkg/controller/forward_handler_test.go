@@ -52,6 +52,29 @@ func TestForwardHandlerRemoteAborts_whenPeerForwardingDisabled(t *testing.T) {
 	assertNoForwardCommand(t, commands)
 }
 
+func TestForwardHandlerSuspendedPortAbortsWithoutCommand(t *testing.T) {
+	// Given
+	forwarder, commands := newTestForwarder(t, true)
+	const port = 41006
+	allocateTestPort(t, forwarder.store, port, portMapping{
+		AgentID:   "agent-a",
+		Target:    "172.30.1.5:8080",
+		Suspended: true,
+	})
+	client, accepted := newForwardTCPPair(t)
+	setForwardDeadline(t, client)
+
+	// When
+	go forwarder.handleConn(context.Background(), port, accepted)
+	_, err := client.Read(make([]byte, 1))
+
+	// Then
+	if err == nil {
+		t.Fatal("read from suspended port = nil, want connection close")
+	}
+	assertNoForwardCommand(t, commands)
+}
+
 func TestForwardHandlerPairAndSplice(t *testing.T) {
 	// Given
 	forwarder, commands := newTestForwarder(t, true)

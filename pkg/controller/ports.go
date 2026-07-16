@@ -31,12 +31,14 @@ type portMapping struct {
 	AgentID     string `json:"agent_id"`
 	Target      string `json:"target"`
 	ContainerID string `json:"container_id,omitempty"`
+	Suspended   bool   `json:"suspended,omitempty"`
 }
 
 type portStore interface {
 	allocate(context.Context, uint32, uint32, portMapping) (uint32, error)
 	release(context.Context, uint32) error
 	lookup(context.Context, uint32) (portMapping, error)
+	update(context.Context, uint32, portMapping) error
 	desired(context.Context) (map[uint32]portMapping, error)
 	releaseByAgent(context.Context, string) ([]uint32, error)
 	watch() (<-chan struct{}, func())
@@ -204,6 +206,16 @@ func (s *memPortStore) lookup(_ context.Context, port uint32) (portMapping, erro
 	return mapping, nil
 }
 
+func (s *memPortStore) update(_ context.Context, port uint32, mapping portMapping) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, found := s.mappings[port]; !found {
+		return errPortNotFound
+	}
+	s.mappings[port] = mapping
+	return nil
+}
+
 func (s *memPortStore) desired(_ context.Context) (map[uint32]portMapping, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -318,6 +330,22 @@ func (s *redisPortStore) lookup(ctx context.Context, port uint32) (portMapping, 
 		return portMapping{}, fmt.Errorf("lookup port %d in redis: %w", port, err)
 	}
 	return decodePortMapping(value)
+}
+
+func (s *redisPortStore) update(ctx context.Context, port uint32, mapping portMapping) error {
+	value, err := json.Marshal(mapping)
+	if err != nil {
+		return fmt.Errorf("marshal port mapping: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(ctx, redisOpTimeout)
+	defer cancel()
+	if err := s.redis.SetArgs(ctx, portKey(port), value, redisv9.SetArgs{Mode: "XX"}).Err(); err != nil {
+		if errors.Is(err, redisv9.Nil) {
+			return errPortNotFound
+		}
+		return fmt.Errorf("update port %d in redis: %w", port, err)
+	}
+	return nil
 }
 
 func (s *redisPortStore) desired(ctx context.Context) (map[uint32]portMapping, error) {
