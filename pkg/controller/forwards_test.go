@@ -121,6 +121,86 @@ func TestCreateForward_returnsAllocatedMapping_whenTargetValid(t *testing.T) {
 	}
 }
 
+func TestCreateForward_usesRequestedPort_whenFreeAndInRange(t *testing.T) {
+	// Given
+	router := newForwardRouter(newPortStore(logr.Discard(), nil))
+
+	// When
+	recorder := forwardRequest(t, router, forwardHTTPRequest{
+		Method: http.MethodPost,
+		Path:   "/api/v1/agents/agent-a/forwards",
+		Body:   `{"target":"172.30.1.5:8080","port":2001}`,
+	})
+	response := decodeForward(t, recorder)
+
+	// Then
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusCreated, recorder.Body.String())
+	}
+	if response.Port != 2001 {
+		t.Fatalf("allocated port = %d, want requested port 2001", response.Port)
+	}
+}
+
+func TestCreateForward_returnsBadRequest_whenRequestedPortOutOfRange(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "below range", body: `{"target":"172.30.1.5:8080","port":1999}`},
+		{name: "above range", body: `{"target":"172.30.1.5:8080","port":2003}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			// Given
+			router := newForwardRouter(newPortStore(logr.Discard(), nil))
+
+			// When
+			recorder := forwardRequest(t, router, forwardHTTPRequest{
+				Method: http.MethodPost,
+				Path:   "/api/v1/agents/agent-a/forwards",
+				Body:   test.body,
+			})
+
+			// Then
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+			}
+			if message := decodeError(t, recorder); message != "port must be within 2000-2002" {
+				t.Fatalf("error = %q, want %q", message, "port must be within 2000-2002")
+			}
+		})
+	}
+}
+
+func TestCreateForward_returnsConflict_whenRequestedPortInUse(t *testing.T) {
+	// Given
+	router := newForwardRouter(newPortStore(logr.Discard(), nil))
+	first := forwardRequest(t, router, forwardHTTPRequest{
+		Method: http.MethodPost,
+		Path:   "/api/v1/agents/agent-a/forwards",
+		Body:   `{"target":"172.30.1.5:8080","port":2001}`,
+	})
+	if first.Code != http.StatusCreated {
+		t.Fatalf("first create status = %d, want %d: %s", first.Code, http.StatusCreated, first.Body.String())
+	}
+
+	// When
+	recorder := forwardRequest(t, router, forwardHTTPRequest{
+		Method: http.MethodPost,
+		Path:   "/api/v1/agents/agent-b/forwards",
+		Body:   `{"target":"172.30.1.5:8081","port":2001}`,
+	})
+
+	// Then
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusConflict, recorder.Body.String())
+	}
+	if message := decodeError(t, recorder); message != "requested port already in use" {
+		t.Fatalf("error = %q, want %q", message, "requested port already in use")
+	}
+}
+
 func TestCreateForward_returnsBadRequest_whenTargetInvalid(t *testing.T) {
 	tests := []struct {
 		name string
