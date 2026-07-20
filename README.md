@@ -137,7 +137,7 @@ On a scrape of `/api/v1/metrics`, the controller:
 1. enumerates the online fleet (the Redis `agent→pod` directory; in-memory mode = locally-held agents) and, with **bounded concurrency**, dispatches a streaming `metrics.scrape` to each agent — over its local `Control` stream, or relayed to the holding pod via `ControllerPeer.DispatchStream`;
 2. each agent pulls its configured `scrape-targets` (node_exporter, dcgm-exporter, …) locally and **streams** each exposition back in chunks, so agent memory stays bounded and no single-message size limit applies;
 3. gives each agent an **independent deadline shorter than `scrape_timeout`** (`--agent-scrape-timeout`, default 5s vs the 10s default); a slow / offline agent is skipped and contributes only `agent_up 0`;
-4. **merges by `MetricFamily`** — parse each exposition with `expfmt.TextParser`, inject `agent=<id>` + `exporter=<name>` labels into every series, fold series sharing a metric name under one family (one HELP/TYPE), then encode once;
+4. **merges by `MetricFamily`** — parse each exposition with `expfmt.NewTextParser(model.UTF8Validation)`, inject `agent=<id>` + `exporter=<name>` labels into every series, fold series sharing a metric name under one family (one HELP/TYPE), then encode once;
 5. synthesizes `agent_up{agent="<id>"}` (1 = the stream completed this round, 0 = offline / timed out) and `hostlink_scrape_target_up{agent,exporter}` (per-exporter health). `agent_up` is the only clean "an agent went down" signal, since Prometheus' native `up` only reflects the controller endpoint.
 
 > **Constraint:** **never string-concatenate expositions.** Duplicate HELP/TYPE lines for the same metric name make the Prometheus parser reject the entire payload. Merge at the `MetricFamily` level.
@@ -199,7 +199,7 @@ Exposure rules are tied to lifecycle via `client.Events()`:
 
 ## Wire Protocol
 
-The services are defined in `pkg/api/hostlink/v1/`. `AgentLink` (agent↔controller) has two bidirectional-stream RPCs; `ControllerPeer` (controller↔controller) has three relay RPCs (unary, server-streaming, and client-streaming):
+The services are defined in `pkg/api/hostlink/v1/`. `AgentLink` (agent↔controller) has two bidirectional-stream RPCs; `ControllerPeer` (controller↔controller) has three request-relay RPCs (unary, server-streaming, and client-streaming) plus a fourth bidirectional `Forward` RPC for the cross-pod port-forward data plane:
 
 ```proto
 service AgentLink {
