@@ -26,7 +26,7 @@ type Service interface {
 // RegisterGRPCService registers the AgentLink server on srv and constructs the
 // controller Service, bringing up the redis-backed registry and the ControllerPeer
 // relay plane when configured (otherwise it runs in single-replica in-memory mode).
-func RegisterGRPCService(logger logr.Logger, nodeName string, srv *grpc.Server) (svc Service, err error) {
+func RegisterGRPCService(ctx context.Context, logger logr.Logger, nodeName string, srv *grpc.Server) (svc Service, err error) {
 	logger = logger.WithName("controller")
 	selfAddr := viper.GetString(flagPeerAdvertiseAddress)
 	redisURL := viper.GetString(flagRedisURL)
@@ -87,7 +87,7 @@ func RegisterGRPCService(logger logr.Logger, nodeName string, srv *grpc.Server) 
 		err = fmt.Errorf("controller: %w", err)
 		return
 	}
-	s.startForwardPlane(logger, redis, forwardRange)
+	s.startForwardPlane(ctx, logger, redis, forwardRange)
 	svc = s
 
 	if crossPod {
@@ -138,16 +138,16 @@ func (svc *service) startPeerPlane(logger logr.Logger, reg *registry) (err error
 	return
 }
 
-func (svc *service) startForwardPlane(logger logr.Logger, redis redisv9.UniversalClient, forwardRange portRange) {
+func (svc *service) startForwardPlane(ctx context.Context, logger logr.Logger, redis redisv9.UniversalClient, forwardRange portRange) {
 	if svc.store == nil {
 		return
 	}
 
-	fwd := newForwarder(logger, svc.registry, svc.sessions, svc.store, svc.peers, svc.selfAddr)
-	svc.listeners = newListenerManager(logger.WithName("listeners"), fwd.handleConn)
-	svc.bindings = newBindingTracker(logger.WithName("bindings"), redis, svc.selfAddr, svc.listeners.boundPorts)
-	fwdCtx, fwdCancel := context.WithCancel(context.Background())
+	fwdCtx, fwdCancel := context.WithCancel(ctx)
 	svc.fwdCancel = fwdCancel
+	fwd := newForwarder(logger, svc.registry, svc.sessions, svc.store, svc.peers, svc.selfAddr)
+	svc.listeners = newListenerManager(fwdCtx, logger.WithName("listeners"), fwd.handleConn)
+	svc.bindings = newBindingTracker(logger.WithName("bindings"), redis, svc.selfAddr, svc.listeners.boundPorts)
 	svc.rangeFrom = forwardRange.from
 	svc.rangeTo = forwardRange.to
 	go runPortReconciler(fwdCtx, logger.WithName("ports"), svc.store, svc.listeners, svc.bindings)

@@ -47,8 +47,8 @@ type portListener struct {
 	listener net.Listener
 }
 
-func newListenerManager(logger logr.Logger, handler connHandler) *listenerManager {
-	ctx, cancel := context.WithCancel(context.Background())
+func newListenerManager(ctx context.Context, logger logr.Logger, handler connHandler) *listenerManager {
+	ctx, cancel := context.WithCancel(ctx)
 	return &listenerManager{
 		logger:  logger,
 		handler: handler,
@@ -74,6 +74,7 @@ func (m *listenerManager) reconcile(desired map[uint32]struct{}) (bound []uint32
 		}
 		if err := current.listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 			m.logger.Error(err, "close public port listener failed", "port", port)
+			recordForwardFailure(forwardFailureListenerClose, port, "", "")
 			continue
 		}
 		delete(m.active, port)
@@ -86,13 +87,18 @@ func (m *listenerManager) reconcile(desired map[uint32]struct{}) (bound []uint32
 		if port == 0 {
 			err := errors.New("public port must be non-zero")
 			m.logger.Error(err, "bind public port listener failed", "port", port)
+			recordForwardFailure(forwardFailureListenerBind, port, "", "")
 			failed = append(failed, port)
 			continue
 		}
 
-		listener, err := net.Listen("tcp", net.JoinHostPort(m.bindIP, strconv.FormatUint(uint64(port), 10)))
+		// A bind racing close() may still succeed despite a cancelled ctx;
+		// close() reclaims it under m.mu, so nothing leaks.
+		var lc net.ListenConfig
+		listener, err := lc.Listen(m.ctx, "tcp", net.JoinHostPort(m.bindIP, strconv.FormatUint(uint64(port), 10)))
 		if err != nil {
 			m.logger.Error(err, "bind public port listener failed", "port", port)
+			recordForwardFailure(forwardFailureListenerBind, port, "", "")
 			failed = append(failed, port)
 			continue
 		}
@@ -132,6 +138,7 @@ func (m *listenerManager) accept(current *portListener, port uint32) {
 				return
 			}
 			m.logger.Error(err, "accept public connection failed", "port", port)
+			recordForwardFailure(forwardFailureAccept, port, "", "")
 			if !m.waitAcceptRetry(backoff) {
 				return
 			}

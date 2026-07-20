@@ -64,14 +64,17 @@ func (f *forwarder) handleConn(ctx context.Context, port uint32, conn *net.TCPCo
 	if err != nil {
 		if errors.Is(err, errPortNotFound) {
 			f.logger.Info("public connection has no port mapping", "port", port)
+			recordForwardFailure(forwardFailurePortNotFound, port, "", "")
 		} else {
 			f.logger.Error(err, "lookup public port mapping failed", "port", port)
+			recordForwardFailure(forwardFailureLookup, port, "", "")
 		}
 		abort()
 		return
 	}
 	if mapping.Suspended {
 		f.logger.Info("public connection has suspended port mapping", "port", port, "agentID", mapping.AgentID)
+		recordForwardFailure(forwardFailurePortSuspended, port, mapping.AgentID, "")
 		abort()
 		return
 	}
@@ -95,6 +98,7 @@ func (f *forwarder) handleLocal(ctx context.Context, port uint32, conn *net.TCPC
 	sessionID, err := newSessionID()
 	if err != nil {
 		f.logger.Error(err, "generate forward session ID failed", "port", port, "agentID", mapping.AgentID)
+		recordForwardFailure(forwardFailureSessionID, port, mapping.AgentID, "")
 		abort()
 		return
 	}
@@ -106,6 +110,7 @@ func (f *forwarder) handleLocal(ctx context.Context, port uint32, conn *net.TCPC
 	}}
 	if err := agent.send(command); err != nil {
 		f.logger.Error(err, "send open forward command failed", "port", port, "agentID", mapping.AgentID)
+		recordForwardFailure(forwardFailureSendCommand, port, mapping.AgentID, "")
 		abort()
 		return
 	}
@@ -116,16 +121,19 @@ func (f *forwarder) handleLocal(ctx context.Context, port uint32, conn *net.TCPC
 	case session := <-waiter:
 		if session.first.GetType() == hostlinkv1.Frame_RESET {
 			f.logger.Info("agent rejected forward connection", "port", port, "agentID", mapping.AgentID)
+			recordForwardFailure(forwardFailureAgentReject, port, mapping.AgentID, "")
 			close(session.done)
 			abort()
 			return
 		}
 		if err := tunnel.SpliceConn(conn, session.stream); err != nil {
 			f.logger.Error(err, "splice public connection failed", "port", port, "agentID", mapping.AgentID)
+			recordForwardFailure(forwardFailureSplice, port, mapping.AgentID, "")
 		}
 		close(session.done)
 	case <-timer.C:
 		f.logger.Info("timed out waiting for agent forward stream", "port", port, "agentID", mapping.AgentID)
+		recordForwardFailure(forwardFailurePairTimeout, port, mapping.AgentID, "")
 		abort()
 	case <-ctx.Done():
 		f.logger.Info("public connection canceled before forward pairing", "port", port, "agentID", mapping.AgentID)
@@ -141,6 +149,7 @@ func (f *forwarder) handleRemote(ctx context.Context, port uint32, conn *net.TCP
 	}
 	if f.peers == nil {
 		f.logger.V(0).Info("cross-pod forwarding disabled", "port", port, "agentID", mapping.AgentID)
+		recordForwardFailure(forwardFailureCrossPodDisabled, port, mapping.AgentID, "")
 		abort()
 		return
 	}
@@ -151,16 +160,19 @@ func (f *forwarder) handleRemote(ctx context.Context, port uint32, conn *net.TCP
 		cancel()
 		if err != nil {
 			f.logger.Error(err, "locate remote agent holder failed", "port", port, "agentID", mapping.AgentID)
+			recordForwardFailure(forwardFailureLocateHolder, port, mapping.AgentID, "")
 			abort()
 			return
 		}
 		if addr == "" {
 			f.logger.Info("remote agent holder is unavailable", "port", port, "agentID", mapping.AgentID)
+			recordForwardFailure(forwardFailureHolderUnavailable, port, mapping.AgentID, "")
 			abort()
 			return
 		}
 		if addr == f.selfAddr {
 			f.logger.Info("remote agent holder points to this controller", "port", port, "agentID", mapping.AgentID)
+			recordForwardFailure(forwardFailureHolderSelf, port, mapping.AgentID, addr)
 			abort()
 			return
 		}
@@ -168,6 +180,7 @@ func (f *forwarder) handleRemote(ctx context.Context, port uint32, conn *net.TCP
 		sessionID, err := newSessionID()
 		if err != nil {
 			f.logger.Error(err, "generate remote forward session ID failed", "port", port, "agentID", mapping.AgentID)
+			recordForwardFailure(forwardFailureSessionID, port, mapping.AgentID, addr)
 			abort()
 			return
 		}
@@ -178,12 +191,14 @@ func (f *forwarder) handleRemote(ctx context.Context, port uint32, conn *net.TCP
 				continue
 			}
 			f.logger.Error(err, "open remote forward failed", "port", port, "agentID", mapping.AgentID)
+			recordForwardFailure(forwardFailureRemoteOpen, port, mapping.AgentID, addr)
 			abort()
 			return
 		}
 
 		if err := tunnel.SpliceConn(conn, stream); err != nil {
 			f.logger.V(1).Info("splice remote public connection failed", "port", port, "agentID", mapping.AgentID, "error", err)
+			recordForwardFailure(forwardFailureSplice, port, mapping.AgentID, addr)
 		}
 		if err := stream.CloseSend(); err != nil {
 			f.logger.V(1).Info("close remote forward stream send failed", "port", port, "agentID", mapping.AgentID, "error", err)
@@ -210,6 +225,7 @@ func runPortReconciler(ctx context.Context, logger logr.Logger, store portStore,
 		cancel()
 		if err != nil {
 			logger.Error(err, "list desired public forward ports failed")
+			recordForwardFailure(forwardFailureListDesired, 0, "", "")
 		} else {
 			ports := make(map[uint32]struct{}, len(desired))
 			for port := range desired {
@@ -217,6 +233,8 @@ func runPortReconciler(ctx context.Context, logger logr.Logger, store portStore,
 			}
 			bound, failed := listeners.reconcile(ports)
 			if len(failed) != 0 {
+				// Bind failures are counted per port inside reconcile, at the
+				// failure site itself.
 				logger.V(0).Info("some public forward listeners failed to bind", "ports", failed)
 			}
 			logger.V(1).Info("public forward listeners reconciled", "ports", bound)

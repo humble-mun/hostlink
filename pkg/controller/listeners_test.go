@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -118,6 +119,7 @@ func TestListenerBindFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bind blocker: %v", err)
 	}
+	failures := forwardFailureCount(t, forwardFailureListenerBind, port, "", "")
 
 	// When
 	bound, failed := manager.reconcile(portSet(port))
@@ -126,6 +128,7 @@ func TestListenerBindFailure(t *testing.T) {
 	wantPorts(t, bound, nil)
 	wantPorts(t, failed, []uint32{port})
 	wantPorts(t, manager.boundPorts(), nil)
+	assertForwardFailureDelta(t, forwardFailureListenerBind, port, "", "", failures, 1)
 	if err := blocker.Close(); err != nil {
 		t.Fatalf("close blocker: %v", err)
 	}
@@ -133,7 +136,39 @@ func TestListenerBindFailure(t *testing.T) {
 	bound, failed = manager.reconcile(portSet(port))
 	wantPorts(t, bound, []uint32{port})
 	wantPorts(t, failed, nil)
+	assertForwardFailureDelta(t, forwardFailureListenerBind, port, "", "", failures, 1)
 }
+
+func TestListenerAcceptFailureCounted(t *testing.T) {
+	// Given
+	manager := newTestListenerManager(t, closeHandler)
+	failures := forwardFailureCount(t, forwardFailureAccept, 41100, "", "")
+
+	// When: one transient accept error, then shutdown via net.ErrClosed.
+	manager.wg.Add(1)
+	manager.accept(&portListener{listener: &failingListener{errs: []error{errors.New("accept boom")}}}, 41100)
+
+	// Then
+	assertForwardFailureDelta(t, forwardFailureAccept, 41100, "", "", failures, 1)
+}
+
+// failingListener returns its queued errors from Accept, then net.ErrClosed so
+// the accept loop shuts down cleanly.
+type failingListener struct {
+	errs []error
+}
+
+func (l *failingListener) Accept() (net.Conn, error) {
+	if len(l.errs) == 0 {
+		return nil, net.ErrClosed
+	}
+	err := l.errs[0]
+	l.errs = l.errs[1:]
+	return nil, err
+}
+
+func (l *failingListener) Close() error   { return nil }
+func (l *failingListener) Addr() net.Addr { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)} }
 
 func TestListenerInFlightSurvivesRemoval(t *testing.T) {
 	// Given
@@ -237,7 +272,7 @@ func closeHandler(_ context.Context, _ uint32, conn *net.TCPConn) {
 
 func newTestListenerManager(t *testing.T, handler connHandler) *listenerManager {
 	t.Helper()
-	manager := newListenerManager(logr.Discard(), handler)
+	manager := newListenerManager(t.Context(), logr.Discard(), handler)
 	manager.bindIP = "127.0.0.1"
 	t.Cleanup(func() {
 		if err := manager.close(); err != nil {

@@ -3,10 +3,13 @@ module github.com/humble-mun/hostlink
 go 1.26.3
 
 require (
+	github.com/containerd/errdefs v1.0.0
 	github.com/docker/docker v28.5.2+incompatible
+	github.com/docker/go-connections v0.7.0
 	github.com/gin-gonic/gin v1.12.0
 	github.com/go-logr/logr v1.4.3
 	github.com/humble-mun/chassis v0.1.9
+	github.com/prometheus/client_golang v1.23.2
 	github.com/prometheus/client_model v0.6.2
 	github.com/prometheus/common v0.69.0
 	github.com/redis/go-redis/v9 v9.21.0
@@ -27,12 +30,10 @@ require (
 	github.com/bytedance/sonic/loader v0.5.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cloudwego/base64x v0.1.7 // indirect
-	github.com/containerd/errdefs v1.0.0 // indirect
 	github.com/containerd/errdefs/pkg v0.3.0 // indirect
 	github.com/containerd/log v0.1.0 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/distribution/reference v0.6.0 // indirect
-	github.com/docker/go-connections v0.7.0 // indirect
 	github.com/docker/go-units v0.5.0 // indirect
 	github.com/emicklei/go-restful/v3 v3.13.0 // indirect
 	github.com/evanphx/json-patch/v5 v5.9.11 // indirect
@@ -83,7 +84,6 @@ require (
 	github.com/pelletier/go-toml/v2 v2.4.1 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
-	github.com/prometheus/client_golang v1.23.2 // indirect
 	github.com/prometheus/procfs v0.20.1 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
 	github.com/quic-go/quic-go v0.60.0 // indirect

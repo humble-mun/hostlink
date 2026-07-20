@@ -56,7 +56,7 @@ func newRootCommand() *cobra.Command {
 			}
 
 			var svc controller.Service
-			if svc, err = controller.RegisterGRPCService(base.RootLogger, base.NodeName, srv); err != nil {
+			if svc, err = controller.RegisterGRPCService(base.Ctx, base.RootLogger, base.NodeName, srv); err != nil {
 				base.Logger.Error(err, "register controller grpc service failed")
 				return
 			}

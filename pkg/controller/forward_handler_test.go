@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	dto "github.com/prometheus/client_model/go"
 	"google.golang.org/grpc/metadata"
 
 	hostlinkv1 "github.com/humble-mun/hostlink/pkg/api/hostlink/v1"
@@ -21,6 +22,7 @@ func TestForwardHandlerUnknownPort(t *testing.T) {
 	forwarder, commands := newTestForwarder(t, false)
 	client, accepted := newForwardTCPPair(t)
 	setForwardDeadline(t, client)
+	failures := forwardFailureCount(t, forwardFailurePortNotFound, 41001, "", "")
 
 	// When
 	go forwarder.handleConn(context.Background(), 41001, accepted)
@@ -31,6 +33,7 @@ func TestForwardHandlerUnknownPort(t *testing.T) {
 		t.Fatal("read from unknown port = nil, want connection close")
 	}
 	assertNoForwardCommand(t, commands)
+	assertForwardFailureDelta(t, forwardFailurePortNotFound, 41001, "", "", failures, 1)
 }
 
 func TestForwardHandlerRemoteAborts_whenPeerForwardingDisabled(t *testing.T) {
@@ -40,6 +43,7 @@ func TestForwardHandlerRemoteAborts_whenPeerForwardingDisabled(t *testing.T) {
 	allocateTestPort(t, forwarder.store, port, portMapping{AgentID: "agent-a", Target: "172.30.1.5:8080"})
 	client, accepted := newForwardTCPPair(t)
 	setForwardDeadline(t, client)
+	failures := forwardFailureCount(t, forwardFailureCrossPodDisabled, port, "agent-a", "")
 
 	// When
 	go forwarder.handleConn(context.Background(), port, accepted)
@@ -50,6 +54,7 @@ func TestForwardHandlerRemoteAborts_whenPeerForwardingDisabled(t *testing.T) {
 		t.Fatal("read for non-local agent = nil, want connection close")
 	}
 	assertNoForwardCommand(t, commands)
+	assertForwardFailureDelta(t, forwardFailureCrossPodDisabled, port, "agent-a", "", failures, 1)
 }
 
 func TestForwardHandlerSuspendedPortAbortsWithoutCommand(t *testing.T) {
@@ -63,6 +68,7 @@ func TestForwardHandlerSuspendedPortAbortsWithoutCommand(t *testing.T) {
 	})
 	client, accepted := newForwardTCPPair(t)
 	setForwardDeadline(t, client)
+	failures := forwardFailureCount(t, forwardFailurePortSuspended, port, "agent-a", "")
 
 	// When
 	go forwarder.handleConn(context.Background(), port, accepted)
@@ -73,6 +79,7 @@ func TestForwardHandlerSuspendedPortAbortsWithoutCommand(t *testing.T) {
 		t.Fatal("read from suspended port = nil, want connection close")
 	}
 	assertNoForwardCommand(t, commands)
+	assertForwardFailureDelta(t, forwardFailurePortSuspended, port, "agent-a", "", failures, 1)
 }
 
 func TestForwardHandlerPairAndSplice(t *testing.T) {
@@ -151,6 +158,7 @@ func TestForwardHandlerAgentDialFailed(t *testing.T) {
 	allocateTestPort(t, forwarder.store, port, portMapping{AgentID: "agent-a", Target: "172.30.1.5:8080"})
 	client, accepted := newForwardTCPPair(t)
 	setForwardDeadline(t, client)
+	failures := forwardFailureCount(t, forwardFailureAgentReject, port, "agent-a", "")
 	handlerDone := make(chan struct{})
 	go func() {
 		forwarder.handleConn(context.Background(), port, accepted)
@@ -174,6 +182,7 @@ func TestForwardHandlerAgentDialFailed(t *testing.T) {
 	}
 	waitForwardDone(t, session.done)
 	waitHandlerDone(t, handlerDone)
+	assertForwardFailureDelta(t, forwardFailureAgentReject, port, "agent-a", "", failures, 1)
 }
 
 func TestForwardHandlerPairTimeout(t *testing.T) {
@@ -184,6 +193,7 @@ func TestForwardHandlerPairTimeout(t *testing.T) {
 	allocateTestPort(t, forwarder.store, port, portMapping{AgentID: "agent-a", Target: "172.30.1.5:8080"})
 	client, accepted := newForwardTCPPair(t)
 	setForwardDeadline(t, client)
+	failures := forwardFailureCount(t, forwardFailurePairTimeout, port, "agent-a", "")
 	handlerDone := make(chan struct{})
 	go func() {
 		forwarder.handleConn(context.Background(), port, accepted)
@@ -201,6 +211,30 @@ func TestForwardHandlerPairTimeout(t *testing.T) {
 	waitHandlerDone(t, handlerDone)
 	if forwarder.sessions.deliver(command.GetOpenForward().GetSessionId(), &forwardSession{}) {
 		t.Fatal("deliver after pairing timeout = true, want false")
+	}
+	assertForwardFailureDelta(t, forwardFailurePairTimeout, port, "agent-a", "", failures, 1)
+}
+
+// forwardFailureCount reads the current value of one forwardFailure series.
+// Counters are process-global, so tests assert deltas against a baseline
+// rather than absolute values.
+func forwardFailureCount(t *testing.T, reason string, port uint32, agentID, peer string) float64 {
+	t.Helper()
+	counter, err := forwardFailure.GetMetricWithLabelValues(reason, forwardPortLabel(port), agentID, peer)
+	if err != nil {
+		t.Fatalf("get forward failure counter %q: %v", reason, err)
+	}
+	metric := new(dto.Metric)
+	if err := counter.Write(metric); err != nil {
+		t.Fatalf("read forward failure counter %q: %v", reason, err)
+	}
+	return metric.GetCounter().GetValue()
+}
+
+func assertForwardFailureDelta(t *testing.T, reason string, port uint32, agentID, peer string, baseline, want float64) {
+	t.Helper()
+	if got := forwardFailureCount(t, reason, port, agentID, peer) - baseline; got != want {
+		t.Fatalf("forward failure %q delta = %v, want %v", reason, got, want)
 	}
 }
 
